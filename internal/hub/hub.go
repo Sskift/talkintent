@@ -62,6 +62,11 @@ type idempotencyRecord struct {
 	expiresAt time.Time
 }
 
+// envelopeWriteTimeout bounds a single frame write to a daemon; a peer that cannot
+// drain a small JSON frame in this long is dead and the read loop's heartbeat deadline
+// will reap it.
+const envelopeWriteTimeout = 10 * time.Second
+
 type daemonSession struct {
 	sessionID      string
 	conn           *websocket.Conn
@@ -706,12 +711,21 @@ func (h *HubServer) sendEnvelope(ctx context.Context, sess *daemonSession, msgTy
 	if err != nil {
 		return
 	}
+	// The caller's ctx is frequently somebody else's lifetime — for query_request it is
+	// the asker's HTTP request. coder/websocket closes the whole connection if the write
+	// ctx is cancelled before the write is fully acknowledged, and on Windows the payload
+	// reaches the peer before the writing goroutine wakes from the IOCP completion, so an
+	// asker hanging up at that instant would kill the target daemon's socket. Detach the
+	// cancellation and keep only a bounded timeout.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), envelopeWriteTimeout)
+	defer cancel()
+
 	sess.wsLock.Lock()
 	defer sess.wsLock.Unlock()
 	if sess.closed {
 		return
 	}
-	_ = sess.conn.Write(ctx, websocket.MessageText, b)
+	_ = sess.conn.Write(writeCtx, websocket.MessageText, b)
 }
 
 func (h *HubServer) drainOfflineQueue(ctx context.Context, sess *daemonSession) {
@@ -1123,8 +1137,12 @@ func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 			TimeoutSeconds:  timeoutSec,
 			CreatedAt:       q.CreatedAt,
 		}
-		h.sendEnvelope(r.Context(), sess, protocol.TypeQueryRequest, queryReq)
-		_ = h.store.UpdateQueryStatus(r.Context(), queryID, protocol.QueryStatusDispatched, "", nil, 0, protocol.TokenUsage{}, "")
+		// Once the frame is on the wire the daemon owns the query; the status record must
+		// say so even if the asker hangs up right now, or cancelDispatchedQuery (which only
+		// acts on dispatched queries) would never tell the daemon to stop.
+		dispatchCtx := context.WithoutCancel(r.Context())
+		h.sendEnvelope(dispatchCtx, sess, protocol.TypeQueryRequest, queryReq)
+		_ = h.store.UpdateQueryStatus(dispatchCtx, queryID, protocol.QueryStatusDispatched, "", nil, 0, protocol.TokenUsage{}, "")
 		q.Status = protocol.QueryStatusDispatched
 	} else {
 		q.QueuePosition, _ = h.store.GetQueuePosition(r.Context(), queryID)

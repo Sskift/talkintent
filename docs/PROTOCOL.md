@@ -1,9 +1,9 @@
 # TalkIntent Wire Protocol Specification
 
-Version: 1.0.0  
-Status: Frozen Protocol Specification  
+Version: 1.1.0  
+Status: Protocol Specification (Aligned with Implementation)  
 Base Path: `/api/v1`  
-WebSocket Path: `/ws/daemon`
+WebSocket Path: `/ws/daemon`  
 
 ---
 
@@ -11,7 +11,7 @@ WebSocket Path: `/ws/daemon`
 
 ### 1.1 Transport Channels
 TalkIntent defines two primary transport channels:
-1. **Outbound WebSocket (`/ws/daemon`)**: Established by background client daemons (`talkintent daemon`) to the central Hub. Used for persistent bidirectional signaling, heartbeats, task push, and answer delivery. Survives NAT and firewalls.
+1. **Outbound WebSocket (`/ws/daemon`)**: Established by background client daemons (`talkintent daemon`) to the central Hub. Used for persistent bidirectional signaling, heartbeats, task dispatch, cancellation, and answer delivery. Survives NAT and firewalls.
 2. **REST API (`/api/v1/*`)**: Used by clients (CLI, Claude Code Skill, Web UI, Feishu Open Platform) to initiate queries, query status, configure members, and retrieve audit trails.
 
 ### 1.2 Common JSON Envelope & Versioning
@@ -30,14 +30,14 @@ All WebSocket frames use a standardized top-level JSON envelope with an explicit
 #### Envelope Fields
 | Field | Type | Description |
 |---|---|---|
-| `version` | string | Protocol version. Fixed to `"v1"`. Clients must reject major version mismatches. |
+| `version` | string | Protocol version. Fixed to `"v1"`. Both Hub and Daemon reject major version mismatches. |
 | `type` | string | Message type discriminator. |
 | `id` | string | Unique message identifier (UUIDv4 or ULID). Used for tracing and request-response matching. |
 | `timestamp` | int64 | Epoch millisecond timestamp of message generation. |
 | `payload` | object | Type-specific payload body. |
 
 #### Compatibility Rules
-- **Forward Compatibility**: Receivers must ignore unknown JSON properties in both the envelope and payload objects.
+- **Forward Compatibility**: Receivers must ignore unknown JSON properties in both envelope and payload.
 - **Breaking Changes**: Any breaking schema modification will increment `version` to `"v2"`.
 
 ### 1.3 Standard Error Format
@@ -59,12 +59,12 @@ All REST error responses follow a uniform JSON schema:
 | Code | HTTP Status | Description |
 |---|---|---|
 | `UNAUTHORIZED` | 401 | Missing or invalid Bearer token. |
-| `FORBIDDEN` | 403 | Token lacks required permission (e.g. non-admin calling admin endpoint). |
+| `FORBIDDEN` | 403 | Token lacks required permission (e.g. non-admin calling admin endpoint or unauthorized query detail lookup). |
 | `INVALID_ARGUMENT` | 400 | Malformed JSON body or invalid parameter values. |
-| `AMBIGUOUS_TARGET` | 400 | Target name matches multiple members. Candidates returned in details. |
+| `AMBIGUOUS_TARGET` | 400 | Target name matches multiple members. Candidates returned in details (deduplicated by member ID). |
 | `NOT_FOUND` | 404 | Target member or query ID not found. |
 | `CONFLICT` | 409 | Resource already exists (e.g. duplicate member name). |
-| `RATE_LIMITED` | 429 | Query submission rate limit exceeded. |
+| `RATE_LIMITED` | 429 | Query submission rate limit exceeded (60 QPM, 10 burst). |
 | `INTERNAL_ERROR` | 500 | Unexpected server error. |
 
 ---
@@ -75,7 +75,7 @@ All REST error responses follow a uniform JSON schema:
 The client daemon initiates an HTTP Upgrade request:
 ```http
 GET /ws/daemon HTTP/1.1
-Host: hub.talkintent.internal
+Host: hub.talkintent.internal:8080
 Upgrade: websocket
 Connection: Upgrade
 Sec-WebSocket-Version: 13
@@ -88,10 +88,10 @@ X-Machine-Name: zhangsan-mbp
 - **Status 403**: Member account disabled.
 
 **Transport & Session Guarantees**:
-- **Frame Read Limit**: Both client and Hub configure WebSocket read limits to 2 MB (`conn.SetReadLimit(2 * 1024 * 1024)`) to avoid frame limit disconnections on large summaries or multi-file inspections.
-- **Session Takeover**: When a member reconnects, Hub issues a fresh UUID `session_id` in `hub_ack` and gracefully closes any previous session for that member ID with code `StatusPolicyViolation`.
-- **Heartbeat Timeouts**: Daemons ping every 20s. The Hub prunes dead sockets if no frame arrives within 50s (2.5x). Daemons abort the connection if pong response exceeds 10s.
-- **Anti-Hijacking**: Hub verifies that `query_response.query_id` belongs to a query targeting that authenticated session's member ID; spoofed responses are rejected.
+- **Frame Read Limit**: Both Hub and client daemon configure `conn.SetReadLimit(2 * 1024 * 1024)` (2 MB) immediately upon upgrade/dial to avoid frame limit aborts on large diff summaries.
+- **Multi-Device Sessions & Session Takeover**: The Hub tracks sessions in `memberSessions[memberID][sessionID]`. When a member reconnects from the same machine, the Hub performs session takeover: the old connection is terminated with WebSocket close code `StatusPolicyViolation` (1008), and the new session takes over routing.
+- **Heartbeat & Read Deadlines**: Daemons send `heartbeat_ping` every 20 seconds. The Hub enforces a read deadline of 50 seconds (2.5x heartbeat interval). If no frame arrives within 50s, the Hub terminates the half-open socket. Daemons expect `heartbeat_pong` within 10 seconds; timeout triggers exponential backoff reconnection.
+- **Anti-Hijacking Check**: When receiving `query_response`, the Hub verifies that `existingQuery.TargetMemberID == sess.memberID`. Spoofed responses from other members are rejected and logged.
 
 Upon upgrade, the client daemon **MUST** immediately send `daemon_hello`.
 
@@ -100,7 +100,7 @@ Upon upgrade, the client daemon **MUST** immediately send `daemon_hello`.
 ### 2.2 Client -> Hub Message Types
 
 #### 2.2.1 `daemon_hello`
-Announces daemon readiness, machine details, and configured workspace roots.
+Announces daemon readiness, machine details, concurrency limits, and configured workspaces.
 
 ```json
 {
@@ -130,6 +130,7 @@ Announces daemon readiness, machine details, and configured workspace roots.
 
 | Field | Type | Description |
 |---|---|---|
+| `session_id` | string | Optional client-proposed session identifier. |
 | `member_id` | string | Authenticated member ID. |
 | `client_version` | string | Semantic version of the running daemon. |
 | `machine_name` | string | Hostname or machine label. |
@@ -138,7 +139,7 @@ Announces daemon readiness, machine details, and configured workspace roots.
 | `workspaces` | array | List of active workspace definitions known to daemon. |
 
 #### 2.2.2 `heartbeat_ping`
-Sent periodically by the daemon (default interval: 20s) to keep connection alive.
+Sent periodically by the daemon (every 20s) to maintain the WebSocket connection and report probe load.
 ```json
 {
   "version": "v1",
@@ -146,7 +147,7 @@ Sent periodically by the daemon (default interval: 20s) to keep connection alive
   "id": "msg_01J8PING001",
   "timestamp": 1726828820000,
   "payload": {
-    "active_probe_count": 0
+    "active_probe_count": 1
   }
 }
 ```
@@ -178,12 +179,15 @@ Transmits the completed result of a probe execution back to the Hub.
 | Field | Type | Description |
 |---|---|---|
 | `query_id` | string | ID of the originating query. |
-| `status` | string | Execution outcome: `"completed"`, `"refused"`, `"error"`, `"timeout"`. |
-| `answer` | string | Final synthesized natural-language response. Empty on fatal error. |
-| `tools_used` | array[string] | List of tool names invoked. Tool arguments and outputs are NOT included. |
+| `status` | string | Execution outcome: `"completed"` (or `"success"` which Hub normalizes to `"completed"`), `"refused"`, `"error"`, `"timeout"`. |
+| `answer` | string | Final synthesized response text (capped at 16 KB; truncated with ` [truncated by TalkIntent daemon]`). Empty on fatal error. |
+| `tools_used` | array[string] | Sorted list of tool names invoked. Tool arguments and outputs are NOT included. |
 | `duration_ms` | int64 | Total execution time in milliseconds. |
-| `token_usage` | object | LLM token usage breakdown. |
-| `error_message`| string | Present when status is `"error"` or `"timeout"`. |
+| `token_usage` | object | Total prompt and completion token counts. |
+| `error_message`| string | Present when status is `"error"` or `"timeout"`. Sanitized by redactor. |
+
+**Privacy Refusal Semantics & Control Tool (`refuse`)**:
+When a query touches areas restricted by a member's sovereign natural-language privacy rules (`privacy-prompt.md`), the probe agent signals this via a structured control tool `refuse(reason string)` rather than text sniffing. The probe exposes `refuse` in its tool definitions across both OpenAI and Anthropic dialects. When the LLM invokes `refuse`, reasoning halts immediately, returning `status: "refused"` with the sanitized, redacted reason in `answer`. The `tools_used` array records only tools that actually ran in the workspace prior to refusal. For models unable to call tools, a plain-text fallback marked with a leading `REFUSED:` prefix is also honored.
 
 ---
 
@@ -241,19 +245,8 @@ Dispatched by Hub to target daemon to trigger an on-site probe execution.
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `query_id` | string | Unique query identifier. |
-| `asker_id` | string | Member ID of the requester. |
-| `asker_name` | string | Human-readable name of the requester. |
-| `asker_type` | string | Originator type: `"member"`, `"feishu"`, `"anonymous"`. |
-| `query` | string | Raw query text. |
-| `target_workspace`| string | Optional workspace identifier. If empty, probe inspects all registered workspaces. |
-| `timeout_seconds` | int | Maximum execution time allowed before daemon aborts (default: 60). |
-| `created_at` | int64 | Epoch millisecond timestamp of query creation. |
-
 #### 2.3.4 `query_cancel`
-Sent by Hub if the asker cancels the query or HTTP long-poll client disconnects before execution begins.
+Dispatched by Hub if the asker cancels the query or HTTP long-poll client disconnects before completion.
 ```json
 {
   "version": "v1",
@@ -266,6 +259,7 @@ Sent by Hub if the asker cancels the query or HTTP long-poll client disconnects 
   }
 }
 ```
+*Client daemon cancels the running probe's `context.CancelFunc` from its `activeQueries` map.*
 
 ---
 
@@ -301,8 +295,7 @@ Exchanges a one-time invite code for a permanent member token.
 ```json
 {
   "invite_code": "INV-7K9M-2X4Q",
-  "machine_name": "wangwu-laptop",
-  "client_version": "1.0.0"
+  "machine_name": "wangwu-workstation"
 }
 ```
 - **Response 200 OK**:
@@ -310,17 +303,17 @@ Exchanges a one-time invite code for a permanent member token.
 {
   "member_id": "mem_01J8WANGWU",
   "member_name": "王五",
-  "token": "ti_mem_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
-  "hub_url": "http://127.0.0.1:8080"
+  "token": "tok_sec_01J8WANGWU_987654321",
+  "hub_url": "http://hub.talkintent.internal:8080"
 }
 ```
 
 ---
 
-### 3.2 Member Directory & Profile
+### 3.2 Member Directory
 
 #### 3.2.1 List Members
-Retrieves all registered team members, their aliases, and real-time online status.
+Retrieves the registered member directory and live online/offline presence status.
 - **Route**: `GET /api/v1/members`
 - **Headers**: `Authorization: Bearer <member_token>`
 - **Response 200 OK**:
@@ -330,51 +323,27 @@ Retrieves all registered team members, their aliases, and real-time online statu
     {
       "id": "mem_01J8ZHANGSAN",
       "name": "张三",
-      "aliases": ["zhangsan", "三哥", "zs"],
+      "aliases": ["zhangsan", "三哥"],
       "online": true,
-      "last_seen_at": 1726828820000,
-      "machine_name": "zhangsan-mbp",
-      "workspaces": ["talkintent-backend", "talkintent-web"],
-      "has_feishu_bot": true
+      "last_seen_at": 1726828820000
     },
     {
       "id": "mem_01J8LISI",
       "name": "李四",
-      "aliases": ["lisi", "四弟"],
+      "aliases": ["lisi"],
       "online": false,
-      "last_seen_at": 1726815000000,
-      "machine_name": "lisi-desktop",
-      "workspaces": ["talkintent-docs"],
-      "has_feishu_bot": false
+      "last_seen_at": 1726825200000
     }
   ]
 }
 ```
 
-#### 3.2.2 Get Member Detail
-- **Route**: `GET /api/v1/members/{id}`
-- **Headers**: `Authorization: Bearer <member_token>`
-- **Response 200 OK**: Single `MemberInfo` object.
-
-#### 3.2.3 Update Current Member Profile
-Allows member to modify their own name and aliases.
-- **Route**: `PUT /api/v1/members/me`
-- **Headers**: `Authorization: Bearer <member_token>`
-- **Request Body**:
-```json
-{
-  "name": "张三",
-  "aliases": ["zhangsan", "三哥", "老张"]
-}
-```
-- **Response 200 OK**: Updated `MemberInfo` object.
-
 ---
 
-### 3.3 Query Lifecycle & Long-Polling
+### 3.3 Query Execution & Polling
 
-#### 3.3.1 Submit a Query
-Initiates a query targeting a colleague's workspace.
+#### 3.3.1 Submit Query
+Submits a query targeting a teammate's dev workspace.
 - **Route**: `POST /api/v1/queries`
 - **Headers**: `Authorization: Bearer <member_token>`
 - **Request Body**:
@@ -385,19 +354,26 @@ Initiates a query targeting a colleague's workspace.
   "target_workspace": "",
   "timeout_seconds": 60,
   "ttl_seconds": 86400,
-  "idempotency_key": "cli_submit_01J8ABC",
-  "wait": true
+  "wait": true,
+  "idempotency_key": "idemp_12345"
 }
 ```
 
-##### Success Response (Target Online & Dispatched) — 202 Accepted:
+##### Success Response (Target Online & Completed via Wait) — 200 OK:
 ```json
 {
   "query_id": "qry_01J8QRY999",
-  "status": "dispatched",
+  "status": "completed",
+  "asker_id": "mem_01J8LISI",
+  "asker_name": "李四",
   "target_member_id": "mem_01J8ZHANGSAN",
   "target_member_name": "张三",
-  "created_at": 1726828805000
+  "query": "问一下张三现在登录模块重构得怎么样了",
+  "answer": "张三目前正在 feature/auth-v2 分支重构 JWT 验证中间件...",
+  "tools_used": ["git_status", "git_diff", "read_file"],
+  "duration_ms": 4210,
+  "created_at": 1726828805000,
+  "completed_at": 1726828809210
 }
 ```
 
@@ -406,15 +382,15 @@ Initiates a query targeting a colleague's workspace.
 {
   "query_id": "qry_01J8QRY999",
   "status": "queued",
-  "target_member_id": "mem_01J8LISI",
-  "target_member_name": "李四",
+  "target_member_id": "mem_01J8ZHANGSAN",
+  "target_member_name": "张三",
   "queue_position": 1,
   "ttl_expires_at": 1726915205000,
   "created_at": 1726828805000
 }
 ```
 
-##### Ambiguity Error (Multiple Matches) — 400 Bad Request:
+##### Ambiguity Error (Multiple Matches) — 400 Bad Request / 300 Multiple Choices:
 ```json
 {
   "error": {
@@ -433,9 +409,8 @@ Initiates a query targeting a colleague's workspace.
 #### 3.3.2 Get Query Detail & Long-Polling
 Retrieves query status and answer.
 - **Route**: `GET /api/v1/queries/{id}?wait={duration}`
-- **Query Parameter `wait`**: Optional duration string (e.g. `30s`, `10s`, max `60s`).
-  - If query is already in a terminal state (`completed`, `refused`, `error`, `timeout`, `expired`), returns immediately.
-  - If query is still in `dispatched` or `queued`, the server holds the HTTP connection until the query completes or `wait` expires.
+- **Headers**: `Authorization: Bearer <member_token>` *(Enforces F9: Caller must be Asker, Target, or Admin)*
+- **Query Parameter `wait`**: Optional duration string (e.g. `30s`, `15s`).
 
 ##### Response 200 OK (Completed):
 ```json
@@ -447,26 +422,14 @@ Retrieves query status and answer.
   "target_member_id": "mem_01J8ZHANGSAN",
   "target_member_name": "张三",
   "query": "问一下张三现在登录模块重构得怎么样了",
-  "answer": "张三目前正在 feature/auth-v2 分支重构 JWT 验证中间件，最新提交完成了 RSA 密钥解析。本地修改了 3 个文件（未提交），新增了 RefreshToken 结构体。",
+  "answer": "张三目前正在 feature/auth-v2 分支重构 JWT 验证中间件...",
   "tools_used": ["git_status", "git_diff", "read_file"],
   "duration_ms": 4210,
+  "ttl_expires_at": 1726915205000,
+  "target_workspace": "",
+  "origin": "cli",
   "created_at": 1726828805000,
   "completed_at": 1726828809210
-}
-```
-
-##### Response 200 OK (Still Pending after wait):
-```json
-{
-  "query_id": "qry_01J8QRY999",
-  "status": "queued",
-  "asker_id": "mem_01J8LISI",
-  "asker_name": "李四",
-  "target_member_id": "mem_01J8ZHANGSAN",
-  "target_member_name": "张三",
-  "query": "问一下张三现在登录模块重构得怎么样了",
-  "queue_position": 1,
-  "created_at": 1726828805000
 }
 ```
 
@@ -475,7 +438,7 @@ Retrieves query status and answer.
 ### 3.4 Audit Trails
 
 #### 3.4.1 Inbound Audit Log
-Shows who queried the authenticated member's dev workspace, when, what was asked, and what was answered.
+Shows who queried the authenticated member's dev workspace, what was asked, and what was answered.
 - **Route**: `GET /api/v1/audit/inbound?limit=50&offset=0`
 - **Headers**: `Authorization: Bearer <member_token>`
 - **Response 200 OK**:
@@ -499,7 +462,7 @@ Shows who queried the authenticated member's dev workspace, when, what was asked
 ```
 
 #### 3.4.2 Outbound Audit Log
-Shows all queries initiated by the authenticated member.
+Shows queries initiated by the authenticated member.
 - **Route**: `GET /api/v1/audit/outbound?limit=50&offset=0`
 - **Headers**: `Authorization: Bearer <member_token>`
 - **Response 200 OK**: List of outbound query records.
@@ -516,7 +479,7 @@ Shows all queries initiated by the authenticated member.
 {
   "bound": true,
   "app_id": "cli_aa17a38637f8dbb7",
-  "webhook_url": "https://hub.empeirion.cn/api/v1/feishu/webhook/mem_01J8ZHANGSAN"
+  "webhook_url": "http://hub.talkintent.internal:8080/api/v1/feishu/webhook/mem_01J8ZHANGSAN"
 }
 ```
 
@@ -532,13 +495,7 @@ Shows all queries initiated by the authenticated member.
   "encrypt_key": "enc_zzzzzzzzzzzzzzzzzz"
 }
 ```
-- **Response 200 OK**:
-```json
-{
-  "success": true,
-  "webhook_url": "https://hub.empeirion.cn/api/v1/feishu/webhook/mem_01J8ZHANGSAN"
-}
-```
+*Credentials are stored encrypted at rest using AES-GCM-256.*
 
 #### 3.5.3 Delete Feishu Binding
 - **Route**: `DELETE /api/v1/feishu/binding`
@@ -550,7 +507,7 @@ Shows all queries initiated by the authenticated member.
 ## 4. Feishu Webhook Contract
 
 ### 4.1 URL Verification Challenge
-When configuring the Feishu event subscription URL, Feishu sends a challenge POST:
+When configuring event subscription in Feishu Developer Console:
 ```json
 {
   "challenge": "ajls384kjsdf85423",
@@ -558,7 +515,7 @@ When configuring the Feishu event subscription URL, Feishu sends a challenge POS
   "type": "url_verification"
 }
 ```
-If encrypted, Hub decrypts using AES-CBC-256 with SHA-256 of `encrypt_key`.  
+If encrypted, Hub decrypts using AES-CBC-256 where IV is the first 16 bytes of `SHA256(encrypt_key)` (`keyHash[:16]`).  
 Hub returns:
 ```json
 {
@@ -567,13 +524,12 @@ Hub returns:
 ```
 
 ### 4.2 Signature Verification
-Hub verifies the `X-Lark-Signature` header:
+Hub verifies the `X-Lark-Signature` header using constant-time comparison and enforces a 300s timestamp freshness window:
 ```
 signature = SHA256(timestamp + nonce + encrypt_key + raw_body)
 ```
 
 ### 4.3 Event Dispatch: `im.message.receive_v1`
-When a user sends a message to Zhang San's personal bot:
 1. Hub receives the event payload:
 ```json
 {
@@ -600,9 +556,9 @@ When a user sends a message to Zhang San's personal bot:
   }
 }
 ```
-2. Hub parses message text, creates query targeting member `mem_01J8ZHANGSAN` with `asker_name: "Feishu user (ou_62c7...)"`, `asker_type: "feishu"`.
-3. Hub responds with HTTP 200 `{}` immediately to acknowledge the event.
-4. When the daemon returns the answer, Hub retrieves a `tenant_access_token` and calls Feishu IM reply API:
+2. Hub acknowledges Feishu immediately with HTTP 200 `{}`.
+3. Hub saves `FeishuContext{MessageID: "om_01J8MSG001", ChatID: "oc_65f32e69...", AppID: "..."}` and dispatches the query to the member's daemon.
+4. When the daemon answers, Hub fetches a `tenant_access_token` and calls Feishu IM reply API:
 ```http
 POST /open-apis/im/v1/messages/om_01J8MSG001/reply HTTP/1.1
 Host: open.feishu.cn
@@ -614,4 +570,18 @@ Content-Type: application/json; charset=utf-8
   "msg_type": "text"
 }
 ```
-5. If the mock Feishu server is used in tests (`FEISHU_API_BASE`), Hub directs calls to the mock server instead of `open.feishu.cn`.
+
+---
+
+## 5. Known Gaps and Protocol Discrepancies
+
+The following discrepancies between specification and code have been identified and are documented here as intentional or frozen behaviors:
+
+1. **`protocol.AuditLogEntry` lacks `error_message`**:
+   - In `internal/protocol/rest.go`, `AuditLogEntry` includes `status` but omits `error_message`. However, `store.AuditLogEntryDetailed` and the underlying `events.jsonl` store record the full error message. Callers requiring the exact error description can query `GET /api/v1/queries/{id}`.
+2. **WebSocket Status Taxonomy Normalization**:
+   - Daemons may transmit `status: "success"` or `status: "completed"` in `query_response`. The Hub's `handleDaemonEnvelope` automatically normalizes `success` or empty status to `protocol.QueryStatusCompleted` before saving to store.
+3. **Idempotency Key Persistence**:
+   - `idempotency_key` is cached in memory on the Hub with a 1-hour expiration window. It is not written to `events.jsonl`; an abrupt Hub restart resets the idempotency window.
+4. **Candidate Member Deduplication**:
+   - `ResolveTargetMember` in `internal/store/store.go` automatically deduplicates matching candidate entries by `ID` before evaluating ambiguous target conditions.

@@ -34,4 +34,9 @@ jobs:
         run: go build -v ./...
 
       - name: Go Test
+        if: runner.os != 'Windows'
         run: go test -v -race ./...
+
+      - name: Go Test (Windows)
+        if: runner.os == 'Windows'
+        run: go test -v ./...

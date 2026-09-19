@@ -1,0 +1,106 @@
+services:
+  hub:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: talkintent-hub
+    command: ["hub", "-addr", ":8080", "-data-dir", "/data"]
+    ports:
+      - "18880:8080"
+    volumes:
+      - hub-data:/data
+    restart: unless-stopped
+
+  mockllm:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: talkintent-mockllm
+    entrypoint: ["/usr/local/bin/mockllm"]
+    command: ["-addr", ":8080", "-mode", "openai", "-tools", "git_status,git_diff", "-refuse=full git diff"]
+    ports:
+      - "18890:8080"
+    restart: unless-stopped
+
+  init:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: talkintent-init
+    entrypoint: ["/bin/bash", "/entrypoint-init.sh"]
+    depends_on:
+      - hub
+    volumes:
+      - ./entrypoint-init.sh:/entrypoint-init.sh:ro
+      - hub-data:/shared/hub-data:ro
+      - shared-invites:/shared/invites
+
+  client-alice:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: talkintent-client-alice
+    entrypoint: ["/bin/bash", "/entrypoint-client.sh"]
+    environment:
+      - MEMBER_NAME=alice
+      - MEMBER_MACHINE=alice-laptop
+      - GIT_BRANCH=feature/billing-v1
+      - PRIVACY_RULE=Do not disclose financial transaction details.
+      - TALKINTENT_HUB_URL=http://hub:8080
+      - LLM_BASE_URL=http://mockllm:8080/v1
+    depends_on:
+      - hub
+      - mockllm
+      - init
+    volumes:
+      - ./entrypoint-client.sh:/entrypoint-client.sh:ro
+      - shared-invites:/shared/invites:ro
+    restart: unless-stopped
+
+  client-bob:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: talkintent-client-bob
+    entrypoint: ["/bin/bash", "/entrypoint-client.sh"]
+    environment:
+      - MEMBER_NAME=bob
+      - MEMBER_MACHINE=bob-desktop
+      - GIT_BRANCH=feature/auth-v2
+      - PRIVACY_RULE=The feature/auth-v2 branch is under confidential security refactoring. Refuse details until release.
+      - TALKINTENT_HUB_URL=http://hub:8080
+      - LLM_BASE_URL=http://mockllm:8080/v1
+    depends_on:
+      - hub
+      - mockllm
+      - init
+    volumes:
+      - ./entrypoint-client.sh:/entrypoint-client.sh:ro
+      - shared-invites:/shared/invites:ro
+    restart: unless-stopped
+
+  client-charlie:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: talkintent-client-charlie
+    entrypoint: ["/bin/bash", "/entrypoint-client.sh"]
+    environment:
+      - MEMBER_NAME=charlie
+      - MEMBER_MACHINE=charlie-server
+      - GIT_BRANCH=feature/search-engine
+      - PRIVACY_RULE=Search engine index internals are public for team queries.
+      - TALKINTENT_HUB_URL=http://hub:8080
+      - LLM_BASE_URL=http://mockllm:8080/v1
+    depends_on:
+      - hub
+      - mockllm
+      - init
+    volumes:
+      - ./entrypoint-client.sh:/entrypoint-client.sh:ro
+      - shared-invites:/shared/invites:ro
+    restart: unless-stopped
+
+volumes:
+  hub-data:
+  shared-invites:

@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,16 +35,22 @@ type Server interface {
 
 // HubServer is the central coordination server for TalkIntent.
 type HubServer struct {
-	cfg        *config.HubConfig
-	store      store.Store
-	webFS      fs.FS
-	logger     *slog.Logger
-	httpServer *http.Server
-	listener   net.Listener
+	cfg           *config.HubConfig
+	store         store.Store
+	webFS         fs.FS
+	logger        *slog.Logger
+	httpServer    *http.Server
+	listener      net.Listener
+	feishuHandler *feishu.Handler
+	rateLimiter   *rateLimiter
+	stopCh        chan struct{}
 
-	mu           sync.RWMutex
-	daemonConns  map[string]*daemonSession                      // memberID -> session
-	queryWaiters map[string][]chan *protocol.QueryDetailResponse // queryID -> []chan
+	mu             sync.RWMutex
+	daemonConns    map[string]*daemonSession                       // memberID -> primary/latest session
+	memberSessions map[string]map[string]*daemonSession            // memberID -> sessionID -> session
+	sessionsByID   map[string]*daemonSession                       // sessionID -> session
+	queryWaiters   map[string][]chan *protocol.QueryDetailResponse // queryID -> []chan
+	queryTimeouts  map[string]int                                  // queryID -> timeoutSeconds (for offline queue drain)
 
 	// 1-hour idempotency cache: key -> queryID
 	idempotencyMu    sync.Mutex
@@ -60,9 +66,12 @@ type daemonSession struct {
 	sessionID      string
 	conn           *websocket.Conn
 	memberID       string
+	machineName    string
+	workspaces     []protocol.WorkspaceInfo
 	maxConcurrency int
 	wsLock         sync.Mutex
 	closed         bool
+	lastSeen       time.Time
 }
 
 // NewServer creates a new HubServer instance.
@@ -77,7 +86,7 @@ func NewServer(cfg *config.HubConfig, st store.Store, webFS fs.FS, logger *slog.
 		logger = slog.Default()
 	}
 
-	// 1. Ensure Admin Token is initialized and persisted
+	// 1. Ensure Admin Token is initialized and persisted (F4, F25, F46)
 	if cfg.AdminToken == "" {
 		tokenPath := filepath.Join(cfg.DataDir, "admin.token")
 		if data, err := os.ReadFile(tokenPath); err == nil && len(strings.TrimSpace(string(data))) > 0 {
@@ -96,15 +105,41 @@ func NewServer(cfg *config.HubConfig, st store.Store, webFS fs.FS, logger *slog.
 		}
 	}
 
+	qpm := cfg.RateLimits.QueriesPerMinute
+	burst := cfg.RateLimits.Burst
+	if qpm <= 0 && cfg.RateLimit.QueriesPerMinute > 0 {
+		qpm = cfg.RateLimit.QueriesPerMinute
+	}
+	if burst <= 0 && cfg.RateLimit.Burst > 0 {
+		burst = cfg.RateLimit.Burst
+	}
+
 	h := &HubServer{
 		cfg:              cfg,
 		store:            st,
 		webFS:            webFS,
 		logger:           logger,
 		daemonConns:      make(map[string]*daemonSession),
+		memberSessions:   make(map[string]map[string]*daemonSession),
+		sessionsByID:     make(map[string]*daemonSession),
 		queryWaiters:     make(map[string][]chan *protocol.QueryDetailResponse),
+		queryTimeouts:    make(map[string]int),
 		idempotencyCache: make(map[string]idempotencyRecord),
+		rateLimiter:      newRateLimiter(qpm, burst),
+		stopCh:           make(chan struct{}),
 	}
+
+	// Initialize Feishu Webhook & Reply Handler (WP5 integration, F40)
+	feishuCfg := feishu.HandlerConfig{
+		BindingLookup: func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error) {
+			return h.store.GetFeishuBinding(ctx, memberID)
+		},
+		Dispatch: func(ctx context.Context, targetMemberID string, asker feishu.AskerInfo, queryText string, feishuCtx protocol.FeishuContext) (*feishu.DispatchResult, error) {
+			return h.dispatchFeishuQuery(ctx, targetMemberID, asker, queryText, feishuCtx)
+		},
+		Logger: logger,
+	}
+	h.feishuHandler = feishu.NewHandler(feishuCfg)
 
 	mux := http.NewServeMux()
 	h.registerRoutes(mux)
@@ -117,15 +152,35 @@ func NewServer(cfg *config.HubConfig, st store.Store, webFS fs.FS, logger *slog.
 	return h, nil
 }
 
-// Addr returns the network address the server is listening on.
+// Addr returns the network address the server is listening on. Callers poll this from
+// another goroutine while Start is binding (e.g. tests using ":0"), so the listener
+// field is read under the lock.
 func (h *HubServer) Addr() string {
-	if h.listener != nil {
-		return h.listener.Addr().String()
+	h.mu.RLock()
+	ln := h.listener
+	h.mu.RUnlock()
+	if ln != nil {
+		return ln.Addr().String()
 	}
 	return h.cfg.Addr
 }
 
-// Start opens the network port and serves requests until context cancellation.
+// Handler returns the HTTP handler used by the server.
+func (h *HubServer) Handler() http.Handler {
+	return h.httpServer.Handler
+}
+
+// Store returns the underlying storage engine.
+func (h *HubServer) Store() store.Store {
+	return h.store
+}
+
+// AdminToken returns the administrative bearer token.
+func (h *HubServer) AdminToken() string {
+	return h.cfg.AdminToken
+}
+
+// Start opens the network port, launches background tasks, and serves requests until context cancellation.
 func (h *HubServer) Start(ctx context.Context) error {
 	addr := h.cfg.Addr
 	if addr == "" {
@@ -136,8 +191,44 @@ func (h *HubServer) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
+	h.mu.Lock()
 	h.listener = ln
+	h.mu.Unlock()
 	h.logger.Info("TalkIntent Hub listening", "addr", ln.Addr().String(), "data_dir", h.cfg.DataDir)
+
+	// Background ticker for sweeping expired queries and notifying waiters (F19/F41)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.stopCh:
+				return
+			case <-ticker.C:
+				count, err := h.store.SweepExpiredQueries(context.Background())
+				if err == nil && count > 0 {
+					h.logger.Debug("Swept expired queries", "count", count)
+					h.mu.Lock()
+					var waiterIDs []string
+					for qid := range h.queryWaiters {
+						waiterIDs = append(waiterIDs, qid)
+					}
+					h.mu.Unlock()
+
+					for _, qid := range waiterIDs {
+						if q, err := h.store.GetQuery(context.Background(), qid); err == nil && q.Status == protocol.QueryStatusExpired {
+							h.notifyWaiters(qid)
+							if q.FeishuContext != nil && q.FeishuContext.MessageID != "" && h.feishuHandler != nil {
+								_ = h.feishuHandler.OnQueryComplete(context.Background(), q)
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -158,6 +249,23 @@ func (h *HubServer) Start(ctx context.Context) error {
 // Stop gracefully shuts down the server.
 func (h *HubServer) Stop(ctx context.Context) error {
 	h.logger.Info("Shutting down Hub server")
+	select {
+	case <-h.stopCh:
+	default:
+		close(h.stopCh)
+	}
+
+	// Gracefully close all connected WebSocket sessions
+	h.mu.Lock()
+	for _, sess := range h.sessionsByID {
+		sess.closed = true
+		_ = sess.conn.Close(websocket.StatusNormalClosure, "hub shutting down")
+	}
+	h.sessionsByID = make(map[string]*daemonSession)
+	h.memberSessions = make(map[string]map[string]*daemonSession)
+	h.daemonConns = make(map[string]*daemonSession)
+	h.mu.Unlock()
+
 	return h.httpServer.Shutdown(ctx)
 }
 
@@ -187,16 +295,115 @@ func (h *HubServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/feishu/binding", h.handleFeishuBindingGet)
 	mux.HandleFunc("POST /api/v1/feishu/binding", h.handleFeishuBindingSave)
 	mux.HandleFunc("DELETE /api/v1/feishu/binding", h.handleFeishuBindingDelete)
-	mux.HandleFunc("POST /api/v1/feishu/webhook/", h.handleFeishuWebhook)
+	mux.HandleFunc("POST /api/v1/feishu/webhook/", h.feishuHandler.ServeHTTP)
 
 	// Static Web UI
 	if h.webFS != nil {
-		fileServer := http.FileServer(http.FS(h.webFS))
+		sub := h.webFS
+		// If webFS embeds with "static/..." prefix (like embed.FS static/*), un-nest it
+		if _, err := fs.Stat(sub, "static/index.html"); err == nil {
+			if s, err := fs.Sub(sub, "static"); err == nil {
+				sub = s
+			}
+		}
+		fileServer := http.FileServer(http.FS(sub))
 		mux.Handle("/web/", http.StripPrefix("/web", fileServer))
-		mux.HandleFunc("/web", func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/web/", http.StatusPermanentRedirect)
+		mux.HandleFunc("GET /web", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/web/", http.StatusFound)
 		})
+		mux.Handle("GET /static/", http.StripPrefix("/static", fileServer))
+		mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/web/", http.StatusFound)
+		})
+		mux.Handle("GET /index.html", fileServer)
+		mux.Handle("GET /style.css", fileServer)
+		mux.Handle("GET /app.js", fileServer)
 	}
+}
+
+func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+		Error: protocol.ErrorDetail{
+			Code:    code,
+			Message: message,
+		},
+	})
+}
+
+func (h *HubServer) removeWaiter(queryID string, waitCh chan *protocol.QueryDetailResponse) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var remaining []chan *protocol.QueryDetailResponse
+	for _, ch := range h.queryWaiters[queryID] {
+		if ch != waitCh {
+			remaining = append(remaining, ch)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(h.queryWaiters, queryID)
+	} else {
+		h.queryWaiters[queryID] = remaining
+	}
+	return len(remaining)
+}
+
+func (h *HubServer) cancelDispatchedQuery(queryID, targetMemberID, targetWorkspace, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	q, err := h.store.GetQuery(ctx, queryID)
+	if err != nil || q.Status != protocol.QueryStatusDispatched {
+		return
+	}
+
+	targetID := targetMemberID
+	if targetID == "" {
+		targetID = q.TargetMemberID
+	}
+	ws := targetWorkspace
+	if ws == "" {
+		ws = q.TargetWorkspace
+	}
+
+	sess := h.selectSessionForQuery(targetID, ws)
+	if sess == nil {
+		return
+	}
+
+	cancelPayload := protocol.QueryCancelPayload{
+		QueryID: queryID,
+		Reason:  reason,
+	}
+	h.sendEnvelope(ctx, sess, protocol.TypeQueryCancel, cancelPayload)
+	h.logger.Info("Dispatched query cancel frame to daemon", "query_id", queryID, "reason", reason, "member_id", targetID)
+}
+
+func (h *HubServer) getQueryTimeout(queryID string) int {
+	h.mu.RLock()
+	t, ok := h.queryTimeouts[queryID]
+	h.mu.RUnlock()
+	if !ok || t <= 0 {
+		t = 60
+	}
+	if h.cfg.MaxProbeTimeoutSec > 0 && t > h.cfg.MaxProbeTimeoutSec {
+		t = h.cfg.MaxProbeTimeoutSec
+	}
+	return t
+}
+
+func (h *HubServer) setQueryTimeout(queryID string, timeoutSec int) {
+	if timeoutSec <= 0 {
+		timeoutSec = 60
+	}
+	if h.cfg.MaxProbeTimeoutSec > 0 && timeoutSec > h.cfg.MaxProbeTimeoutSec {
+		timeoutSec = h.cfg.MaxProbeTimeoutSec
+	}
+	h.mu.Lock()
+	h.queryTimeouts[queryID] = timeoutSec
+	h.mu.Unlock()
 }
 
 // authenticateMember resolves a member from the Authorization header.
@@ -209,7 +416,7 @@ func (h *HubServer) authenticateMember(r *http.Request) (*protocol.MemberInfo, e
 	return h.store.GetMemberByToken(r.Context(), token)
 }
 
-// authenticateAdmin verifies that the request carries the admin token.
+// authenticateAdmin verifies that the request carries the admin token (F4, F25).
 func (h *HubServer) authenticateAdmin(r *http.Request) bool {
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
@@ -219,23 +426,59 @@ func (h *HubServer) authenticateAdmin(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(token), []byte(h.cfg.AdminToken)) == 1
 }
 
-// handleWebSocket handles incoming client daemon connections with takeover semantics.
+// selectSessionForQuery picks the best daemon session for a member (matching targetWorkspace if specified).
+func (h *HubServer) selectSessionForQuery(memberID string, targetWorkspace string) *daemonSession {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	sessions := h.memberSessions[memberID]
+	if len(sessions) == 0 {
+		return nil
+	}
+
+	if targetWorkspace != "" {
+		for _, sess := range sessions {
+			for _, ws := range sess.workspaces {
+				if ws.Name == targetWorkspace || ws.ID == targetWorkspace || ws.RootPath == targetWorkspace {
+					return sess
+				}
+			}
+		}
+	}
+
+	var best *daemonSession
+	for _, sess := range sessions {
+		if best == nil || sess.lastSeen.After(best.lastSeen) {
+			best = sess
+		}
+	}
+	return best
+}
+
+// handleWebSocket handles incoming client daemon connections with multi-device support and takeover semantics (F16, F17, F18, F23).
 func (h *HubServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	if token == "" {
-		http.Error(w, "missing bearer token", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "missing bearer token")
 		return
 	}
 
 	mem, err := h.store.GetMemberByToken(r.Context(), token)
 	if err != nil {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "invalid token")
 		return
 	}
 
+	// Validate Origin header if present (F16)
+	originPatterns := []string{"localhost:*", "127.0.0.1:*", r.Host}
+	if h.cfg.PublicURL != "" {
+		if u, err := url.Parse(h.cfg.PublicURL); err == nil && u.Host != "" {
+			originPatterns = append(originPatterns, u.Host)
+		}
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		OriginPatterns: originPatterns,
 	})
 	if err != nil {
 		h.logger.Warn("Failed to accept websocket", "err", err)
@@ -243,104 +486,126 @@ func (h *HubServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.CloseNow()
 
-	// Enforce 2 MB frame read limit
+	// Enforce 2 MB frame read limit (F23, DESIGN §6)
 	conn.SetReadLimit(2 * 1024 * 1024)
 
 	sessionUUID, _ := store.RandomHex(16)
-	sess := &daemonSession{
-		sessionID:      sessionUUID,
-		conn:           conn,
-		memberID:       mem.ID,
-		maxConcurrency: config.DefaultMaxConcurrency,
+	sessionID := "sess_" + sessionUUID
+
+	machineName := r.Header.Get("X-Machine-Name")
+	if machineName == "" {
+		machineName = "default"
 	}
 
-	// Connection Takeover: replace any existing session for this member
-	h.mu.Lock()
-	if prevSess, exists := h.daemonConns[mem.ID]; exists {
-		h.logger.Info("Superseding previous daemon connection", "member_id", mem.ID, "prev_session", prevSess.sessionID, "new_session", sessionUUID)
-		prevSess.closed = true
-		_ = prevSess.conn.Close(websocket.StatusPolicyViolation, "superseded by new connection session")
+	sess := &daemonSession{
+		sessionID:      sessionID,
+		conn:           conn,
+		memberID:       mem.ID,
+		machineName:    machineName,
+		maxConcurrency: config.DefaultMaxConcurrency,
+		lastSeen:       time.Now(),
 	}
+
+	// Connection Takeover & Multi-device tracking (F17)
+	h.mu.Lock()
+	if _, ok := h.memberSessions[mem.ID]; !ok {
+		h.memberSessions[mem.ID] = make(map[string]*daemonSession)
+	}
+
+	// Check if this same machine had an active session; if so, gracefully supersede it
+	for prevID, prevSess := range h.memberSessions[mem.ID] {
+		if prevSess.machineName == machineName {
+			h.logger.Info("Superseding previous connection from same machine",
+				"member_id", mem.ID, "machine", machineName, "prev_session", prevID, "new_session", sessionID)
+			prevSess.closed = true
+			delete(h.memberSessions[mem.ID], prevID)
+			delete(h.sessionsByID, prevID)
+			_ = prevSess.conn.Close(websocket.StatusPolicyViolation, "superseded by new connection session")
+		}
+	}
+
+	h.memberSessions[mem.ID][sessionID] = sess
+	h.sessionsByID[sessionID] = sess
 	h.daemonConns[mem.ID] = sess
 	h.mu.Unlock()
 
 	defer func() {
 		h.mu.Lock()
-		curSess := h.daemonConns[mem.ID]
-		if curSess == sess {
-			delete(h.daemonConns, mem.ID)
-		}
-		h.mu.Unlock()
-
-		// Revert unacknowledged in-flight dispatched queries back to queued state
-		h.reconcileInFlightQueries(mem.ID)
-		_ = h.store.SetMemberOnline(context.Background(), mem.ID, false, "", nil)
-	}()
-
-	_ = h.store.SetMemberOnline(r.Context(), mem.ID, true, r.Header.Get("X-Machine-Name"), nil)
-
-	// Heartbeat timeout monitoring: 50s deadline (2.5x 20s interval)
-	lastSeen := time.Now()
-	var lastSeenMu sync.Mutex
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				lastSeenMu.Lock()
-				elapsed := time.Since(lastSeen)
-				lastSeenMu.Unlock()
-				if elapsed > 50*time.Second {
-					h.logger.Warn("Daemon heartbeat timeout (50s exceeded), closing socket", "member_id", mem.ID)
-					_ = conn.Close(websocket.StatusPolicyViolation, "heartbeat timeout")
-					return
+		sess.closed = true
+		if userSessions, ok := h.memberSessions[mem.ID]; ok {
+			delete(userSessions, sessionID)
+			if len(userSessions) == 0 {
+				delete(h.memberSessions, mem.ID)
+				delete(h.daemonConns, mem.ID)
+			} else {
+				for _, rem := range userSessions {
+					h.daemonConns[mem.ID] = rem
+					break
 				}
 			}
 		}
+		delete(h.sessionsByID, sessionID)
+		remainingActive := len(h.memberSessions[mem.ID])
+		h.mu.Unlock()
+
+		// If no more active sessions remain for this member, reconcile in-flight queries and mark offline
+		if remainingActive == 0 {
+			h.reconcileInFlightQueries(mem.ID)
+			_ = h.store.SetMemberOnline(context.Background(), mem.ID, false, "", nil)
+		}
 	}()
 
-	// Read loop
+	_ = h.store.SetMemberOnline(r.Context(), mem.ID, true, machineName, nil)
+
+	heartbeatInterval := h.cfg.HeartbeatIntervalSec
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = 20
+	}
+	heartbeatTimeout := time.Duration(float64(heartbeatInterval)*2.5) * time.Second // 50s deadline (F18)
+
+	sessCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Frame read loop with heartbeat read deadline (F18)
 	for {
-		_, data, err := conn.Read(ctx)
+		readCtx, cancelRead := context.WithTimeout(sessCtx, heartbeatTimeout)
+		_, data, err := conn.Read(readCtx)
+		cancelRead()
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				h.logger.Warn("Daemon heartbeat timeout (50s exceeded), terminating connection",
+					"member_id", mem.ID, "session_id", sess.sessionID)
+				_ = conn.Close(websocket.StatusPolicyViolation, "heartbeat timeout")
+			}
 			break
 		}
-		lastSeenMu.Lock()
-		lastSeen = time.Now()
-		lastSeenMu.Unlock()
+		sess.lastSeen = time.Now()
 
 		var env protocol.Envelope
 		if err := json.Unmarshal(data, &env); err != nil {
 			continue
 		}
-		// Enforce protocol version check
+
+		// Enforce protocol version check (F32)
 		if env.Version != protocol.Version1 {
-			h.logger.Warn("Rejecting frame with unsupported protocol version", "version", env.Version)
-			continue
+			h.logger.Warn("Rejecting frame with unsupported protocol version", "version", env.Version, "session_id", sess.sessionID)
+			_ = conn.Close(websocket.StatusProtocolError, "unsupported protocol version")
+			break
 		}
 
-		h.handleDaemonEnvelope(ctx, sess, env)
+		h.handleDaemonEnvelope(sessCtx, sess, env)
 	}
 }
 
-// reconcileInFlightQueries reverts dispatched queries to queued status on daemon disconnect.
+// reconcileInFlightQueries reverts dispatched queries to queued status on daemon disconnect (F21).
 func (h *HubServer) reconcileInFlightQueries(memberID string) {
-	queued, err := h.store.GetQueuedQueriesForMember(context.Background(), memberID)
+	requeued, err := h.store.RequeueInFlightQueries(context.Background(), memberID)
 	if err != nil {
+		h.logger.Warn("Failed to requeue in-flight queries", "member_id", memberID, "err", err)
 		return
 	}
-	for _, q := range queued {
-		if q.Status == protocol.QueryStatusDispatched {
-			h.logger.Info("Reverting in-flight dispatched query to queued", "query_id", q.QueryID, "member_id", memberID)
-			_ = h.store.UpdateQueryStatus(context.Background(), q.QueryID, protocol.QueryStatusQueued, "", nil, 0, protocol.TokenUsage{}, "")
-		}
+	if len(requeued) > 0 {
+		h.logger.Info("Reverted in-flight dispatched queries to queued", "member_id", memberID, "requeued_count", len(requeued))
 	}
 }
 
@@ -352,17 +617,31 @@ func (h *HubServer) handleDaemonEnvelope(ctx context.Context, sess *daemonSessio
 			if hello.MaxConcurrency > 0 {
 				sess.maxConcurrency = hello.MaxConcurrency
 			}
+			if hello.MachineName != "" {
+				sess.machineName = hello.MachineName
+			}
+			sess.workspaces = hello.Workspaces
+
 			var wsNames []string
 			for _, ws := range hello.Workspaces {
 				wsNames = append(wsNames, ws.Name)
 			}
-			_ = h.store.SetMemberOnline(ctx, sess.memberID, true, hello.MachineName, wsNames)
+			_ = h.store.SetMemberOnline(ctx, sess.memberID, true, sess.machineName, wsNames)
+
+			// Calculate pending queries count for hub_ack (MUST-HAVE)
+			queued, _ := h.store.GetQueuedQueriesForMember(ctx, sess.memberID)
+			pendingCount := len(queued)
+
+			heartbeatInterval := h.cfg.HeartbeatIntervalSec
+			if heartbeatInterval <= 0 {
+				heartbeatInterval = 20
+			}
 
 			ack := protocol.HubAckPayload{
 				SessionID:            sess.sessionID,
 				Authenticated:        true,
-				HeartbeatIntervalSec: 20,
-				PendingQueriesCount:  0,
+				HeartbeatIntervalSec: heartbeatInterval,
+				PendingQueriesCount:  pendingCount,
 			}
 			h.sendEnvelope(ctx, sess, protocol.TypeHubAck, ack)
 			h.drainOfflineQueue(ctx, sess)
@@ -375,7 +654,7 @@ func (h *HubServer) handleDaemonEnvelope(ctx context.Context, sess *daemonSessio
 	case protocol.TypeQueryResponse:
 		var resp protocol.QueryResponsePayload
 		if err := json.Unmarshal(env.Payload, &resp); err == nil {
-			// Anti-hijacking check: verify query target matches this session's memberID
+			// Anti-hijacking check: verify query target matches this session's memberID (F5)
 			existingQ, err := h.store.GetQuery(ctx, resp.QueryID)
 			if err != nil {
 				h.logger.Warn("Ignoring response for unknown query", "query_id", resp.QueryID)
@@ -387,7 +666,7 @@ func (h *HubServer) handleDaemonEnvelope(ctx context.Context, sess *daemonSessio
 				return
 			}
 
-			// Normalize status taxonomy
+			// Normalize status taxonomy: success -> completed (F36)
 			status := resp.Status
 			if status == "success" || status == "" {
 				status = protocol.QueryStatusCompleted
@@ -396,22 +675,18 @@ func (h *HubServer) handleDaemonEnvelope(ctx context.Context, sess *daemonSessio
 			_ = h.store.UpdateQueryStatus(ctx, resp.QueryID, status, resp.Answer, resp.ToolsUsed, resp.DurationMS, resp.TokenUsage, resp.ErrorMessage)
 			h.notifyWaiters(resp.QueryID)
 
-			// Asynchronous Feishu reply if originated from Feishu bot webhook
-			if existingQ.FeishuContext != nil && existingQ.FeishuContext.MessageID != "" {
-				go h.dispatchFeishuReply(existingQ.TargetMemberID, existingQ.FeishuContext.MessageID, resp.Answer)
+			// Asynchronous Feishu reply if originated from Feishu bot webhook (F40)
+			if existingQ.FeishuContext != nil && existingQ.FeishuContext.MessageID != "" && h.feishuHandler != nil {
+				updatedQ, err := h.store.GetQuery(ctx, resp.QueryID)
+				if err == nil {
+					go func(q *protocol.QueryDetailResponse) {
+						replyCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+						defer cancel()
+						_ = h.feishuHandler.OnQueryComplete(replyCtx, q)
+					}(updatedQ)
+				}
 			}
 		}
-	}
-}
-
-func (h *HubServer) dispatchFeishuReply(memberID, messageID, answer string) {
-	binding, err := h.store.GetFeishuBinding(context.Background(), memberID)
-	if err != nil || binding == nil || binding.AppSecret == "" {
-		return
-	}
-	client := feishu.NewClient(binding.AppID, binding.AppSecret, "")
-	if err := client.ReplyMessage(context.Background(), messageID, answer); err != nil {
-		h.logger.Warn("Failed to send Feishu reply", "message_id", messageID, "err", err)
 	}
 }
 
@@ -440,6 +715,9 @@ func (h *HubServer) sendEnvelope(ctx context.Context, sess *daemonSession, msgTy
 }
 
 func (h *HubServer) drainOfflineQueue(ctx context.Context, sess *daemonSession) {
+	// 1. Sweep expired queries first (F19, F41)
+	_, _ = h.store.SweepExpiredQueries(ctx)
+
 	queued, err := h.store.GetQueuedQueriesForMember(ctx, sess.memberID)
 	if err != nil || len(queued) == 0 {
 		return
@@ -451,18 +729,27 @@ func (h *HubServer) drainOfflineQueue(ctx context.Context, sess *daemonSession) 
 	}
 
 	count := 0
+	now := time.Now().UnixMilli()
 	for _, q := range queued {
 		if count >= limit {
 			break
+		}
+		// Skip expired items
+		if q.TTLExpiresAt > 0 && now > q.TTLExpiresAt {
+			continue
 		}
 		req := protocol.QueryRequestPayload{
 			QueryID:         q.QueryID,
 			AskerID:         q.AskerID,
 			AskerName:       q.AskerName,
+			AskerType:       q.Origin,
 			Query:           q.Query,
 			TargetWorkspace: q.TargetWorkspace,
-			TimeoutSeconds:  60,
+			TimeoutSeconds:  h.getQueryTimeout(q.QueryID),
 			CreatedAt:       q.CreatedAt,
+		}
+		if req.AskerType == "" {
+			req.AskerType = "member"
 		}
 		h.sendEnvelope(ctx, sess, protocol.TypeQueryRequest, req)
 		_ = h.store.UpdateQueryStatus(ctx, q.QueryID, protocol.QueryStatusDispatched, "", nil, 0, protocol.TokenUsage{}, "")
@@ -474,6 +761,7 @@ func (h *HubServer) notifyWaiters(queryID string) {
 	h.mu.Lock()
 	waiters := h.queryWaiters[queryID]
 	delete(h.queryWaiters, queryID)
+	delete(h.queryTimeouts, queryID)
 	h.mu.Unlock()
 
 	if len(waiters) == 0 {
@@ -491,46 +779,109 @@ func (h *HubServer) notifyWaiters(queryID string) {
 	}
 }
 
+// dispatchFeishuQuery creates and routes an asynchronous query originating from Feishu (F40).
+func (h *HubServer) dispatchFeishuQuery(ctx context.Context, targetMemberID string, asker feishu.AskerInfo, queryText string, feishuCtx protocol.FeishuContext) (*feishu.DispatchResult, error) {
+	targetMem, err := h.store.GetMember(ctx, targetMemberID)
+	if err != nil {
+		return nil, fmt.Errorf("target member not found: %w", err)
+	}
+
+	queryUUID, _ := store.RandomHex(8)
+	queryID := "q_" + queryUUID
+
+	ttlSec := h.cfg.DefaultQueryTTLSec
+	if ttlSec <= 0 {
+		ttlSec = 86400 // 24 hours default
+	}
+	ttlExpiresAt := time.Now().Add(time.Duration(ttlSec) * time.Second).UnixMilli()
+
+	q := &protocol.QueryDetailResponse{
+		QueryID:          queryID,
+		Status:           protocol.QueryStatusQueued,
+		AskerID:          asker.OpenID,
+		AskerName:        asker.DisplayName(),
+		TargetMemberID:   targetMem.ID,
+		TargetMemberName: targetMem.Name,
+		Query:            queryText,
+		TTLExpiresAt:     ttlExpiresAt,
+		CreatedAt:        time.Now().UnixMilli(),
+		Origin:           "feishu",
+		FeishuContext:    &feishuCtx,
+	}
+
+	if err := h.store.CreateQuery(ctx, q); err != nil {
+		return nil, fmt.Errorf("failed to create query: %w", err)
+	}
+	h.setQueryTimeout(queryID, 60)
+
+	sess := h.selectSessionForQuery(targetMem.ID, "")
+	if sess != nil {
+		queryReq := protocol.QueryRequestPayload{
+			QueryID:        queryID,
+			AskerID:        q.AskerID,
+			AskerName:      q.AskerName,
+			AskerType:      "feishu",
+			Query:          queryText,
+			TimeoutSeconds: 60,
+			CreatedAt:      q.CreatedAt,
+		}
+		h.sendEnvelope(ctx, sess, protocol.TypeQueryRequest, queryReq)
+		_ = h.store.UpdateQueryStatus(ctx, queryID, protocol.QueryStatusDispatched, "", nil, 0, protocol.TokenUsage{}, "")
+		q.Status = protocol.QueryStatusDispatched
+	}
+
+	queuePos, _ := h.store.GetQueuePosition(ctx, queryID)
+	return &feishu.DispatchResult{
+		QueryID:          queryID,
+		Status:           q.Status,
+		TargetMemberName: targetMem.Name,
+		QueuePosition:    queuePos,
+	}, nil
+}
+
+func (h *HubServer) publicURL(r *http.Request) string {
+	if h.cfg.PublicURL != "" {
+		return strings.TrimRight(h.cfg.PublicURL, "/")
+	}
+	scheme := "http"
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s", scheme, r.Host)
+}
+
 // REST Handlers
 
 func (h *HubServer) handleAuthPair(w http.ResponseWriter, r *http.Request) {
 	var req protocol.PairRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "invalid json")
 		return
 	}
 	resp, err := h.store.ConsumeInvite(r.Context(), &req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, err.Error())
 		return
 	}
-	hubURL := h.cfg.PublicURL
-	if hubURL == "" {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		hubURL = fmt.Sprintf("%s://%s", scheme, r.Host)
-	}
-	resp.HubURL = hubURL
+	resp.HubURL = h.publicURL(r)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (h *HubServer) handleAdminInvites(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticateAdmin(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 
 	var req protocol.InviteCreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "invalid json")
 		return
 	}
 	resp, err := h.store.CreateInvite(r.Context(), &req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -539,9 +890,15 @@ func (h *HubServer) handleAdminInvites(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HubServer) handleMembersList(w http.ResponseWriter, r *http.Request) {
+	if !h.authenticateAdmin(r) {
+		if _, err := h.authenticateMember(r); err != nil {
+			writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
+			return
+		}
+	}
 	list, err := h.store.ListMembers(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -551,7 +908,7 @@ func (h *HubServer) handleMembersList(w http.ResponseWriter, r *http.Request) {
 func (h *HubServer) handleMemberMe(w http.ResponseWriter, r *http.Request) {
 	mem, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -561,17 +918,17 @@ func (h *HubServer) handleMemberMe(w http.ResponseWriter, r *http.Request) {
 func (h *HubServer) handleMemberMeUpdate(w http.ResponseWriter, r *http.Request) {
 	mem, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 	var req protocol.MemberUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "invalid json")
 		return
 	}
 	updated, err := h.store.UpdateMember(r.Context(), mem.ID, &req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -579,14 +936,21 @@ func (h *HubServer) handleMemberMeUpdate(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *HubServer) handleMemberGet(w http.ResponseWriter, r *http.Request) {
+	if !h.authenticateAdmin(r) {
+		if _, err := h.authenticateMember(r); err != nil {
+			writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
+			return
+		}
+	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/v1/members/")
+	id = strings.TrimSpace(id)
 	if id == "" {
-		http.Error(w, "missing member id", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "missing member id")
 		return
 	}
 	mem, err := h.store.GetMember(r.Context(), id)
 	if err != nil {
-		http.Error(w, "member not found", http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, protocol.ErrCodeNotFound, "member not found")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -596,22 +960,49 @@ func (h *HubServer) handleMemberGet(w http.ResponseWriter, r *http.Request) {
 func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 	asker, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+			Error: protocol.ErrorDetail{
+				Code:    protocol.ErrCodeUnauthorized,
+				Message: "unauthorized",
+			},
+		})
+		return
+	}
+
+	// Per-asker rate limiting -> 429 (FOCUS / MUST-HAVES)
+	if !h.rateLimiter.Allow(asker.ID) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+			Error: protocol.ErrorDetail{
+				Code:    protocol.ErrCodeRateLimited,
+				Message: "Query submission rate limit exceeded.",
+			},
+		})
 		return
 	}
 
 	var req protocol.QuerySubmitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+			Error: protocol.ErrorDetail{
+				Code:    protocol.ErrCodeInvalidArgument,
+				Message: "invalid json payload",
+			},
+		})
 		return
 	}
 
-	// 1-hour Idempotency verification
+	// F30 Idempotency verification
 	if req.IdempotencyKey != "" {
 		h.idempotencyMu.Lock()
 		rec, exists := h.idempotencyCache[req.IdempotencyKey]
+		h.idempotencyMu.Unlock()
 		if exists && time.Now().Before(rec.expiresAt) {
-			h.idempotencyMu.Unlock()
 			existingQuery, err := h.store.GetQuery(r.Context(), rec.queryID)
 			if err == nil {
 				w.Header().Set("Content-Type", "application/json")
@@ -619,22 +1010,39 @@ func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		h.idempotencyMu.Unlock()
+		if existingQuery, err := h.store.GetQueryByIdempotencyKey(r.Context(), req.IdempotencyKey); err == nil && existingQuery != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(existingQuery)
+			return
+		}
 	}
 
 	// Target member resolution
 	targetMem, candidates, err := h.store.ResolveTargetMember(r.Context(), req.Target)
 	if err != nil {
 		if errors.Is(err, store.ErrAmbiguousMatch) {
+			// AMBIGUOUS_TARGET 400 with candidates (PROTOCOL §1.3, §3.3.1)
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusMultipleChoices)
-			_ = json.NewEncoder(w).Encode(protocol.TargetResolveResponse{
-				Status:     "ambiguous",
-				Candidates: candidates,
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+				Error: protocol.ErrorDetail{
+					Code:    protocol.ErrCodeAmbiguousTarget,
+					Message: fmt.Sprintf("Target '%s' matches multiple members. Please specify exact name.", req.Target),
+					Details: map[string]any{
+						"candidates": candidates,
+					},
+				},
 			})
 			return
 		}
-		http.Error(w, "target member not found", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+			Error: protocol.ErrorDetail{
+				Code:    protocol.ErrCodeNotFound,
+				Message: "target member not found",
+			},
+		})
 		return
 	}
 
@@ -643,9 +1051,23 @@ func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 
 	ttlSec := req.TTLSeconds
 	if ttlSec <= 0 {
-		ttlSec = 3600 // 1 hour default
+		ttlSec = h.cfg.DefaultQueryTTLSec
+		if ttlSec <= 0 {
+			ttlSec = 86400 // 24 hours default
+		}
+	}
+	if h.cfg.MaxQueryTTLSec > 0 && ttlSec > h.cfg.MaxQueryTTLSec {
+		ttlSec = h.cfg.MaxQueryTTLSec
 	}
 	ttlExpiresAt := time.Now().Add(time.Duration(ttlSec) * time.Second).UnixMilli()
+
+	timeoutSec := req.TimeoutSeconds
+	if timeoutSec <= 0 {
+		timeoutSec = 60
+	}
+	if h.cfg.MaxProbeTimeoutSec > 0 && timeoutSec > h.cfg.MaxProbeTimeoutSec {
+		timeoutSec = h.cfg.MaxProbeTimeoutSec
+	}
 
 	q := &protocol.QueryDetailResponse{
 		QueryID:          queryID,
@@ -662,9 +1084,10 @@ func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.CreateQuery(r.Context(), q); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
+	h.setQueryTimeout(queryID, timeoutSec)
 
 	// Cache idempotency key
 	if req.IdempotencyKey != "" {
@@ -674,48 +1097,62 @@ func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 			expiresAt: time.Now().Add(1 * time.Hour),
 		}
 		h.idempotencyMu.Unlock()
+		_ = h.store.SaveIdempotencyKey(r.Context(), req.IdempotencyKey, queryID, ttlExpiresAt)
 	}
 
-	// Check if target member daemon is online
-	h.mu.RLock()
-	sess, online := h.daemonConns[targetMem.ID]
-	h.mu.RUnlock()
+	// Check if target member daemon session is online
+	sess := h.selectSessionForQuery(targetMem.ID, req.TargetWorkspace)
 
+	shouldWait := req.Wait || r.URL.Query().Get("wait") != ""
 	var waitCh chan *protocol.QueryDetailResponse
-	if req.Wait {
+	if shouldWait {
 		waitCh = make(chan *protocol.QueryDetailResponse, 1)
 		h.mu.Lock()
 		h.queryWaiters[queryID] = append(h.queryWaiters[queryID], waitCh)
 		h.mu.Unlock()
 	}
 
-	if online {
+	if sess != nil {
 		queryReq := protocol.QueryRequestPayload{
 			QueryID:         queryID,
 			AskerID:         asker.ID,
 			AskerName:       asker.Name,
+			AskerType:       "member",
 			Query:           req.Query,
 			TargetWorkspace: req.TargetWorkspace,
-			TimeoutSeconds:  req.TimeoutSeconds,
+			TimeoutSeconds:  timeoutSec,
 			CreatedAt:       q.CreatedAt,
 		}
 		h.sendEnvelope(r.Context(), sess, protocol.TypeQueryRequest, queryReq)
 		_ = h.store.UpdateQueryStatus(r.Context(), queryID, protocol.QueryStatusDispatched, "", nil, 0, protocol.TokenUsage{}, "")
 		q.Status = protocol.QueryStatusDispatched
+	} else {
+		q.QueuePosition, _ = h.store.GetQueuePosition(r.Context(), queryID)
 	}
 
-	if req.Wait && waitCh != nil {
-		waitTimeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if shouldWait && waitCh != nil {
+		waitTimeout := time.Duration(timeoutSec) * time.Second
 		if waitTimeout <= 0 {
+			waitTimeout = 60 * time.Second
+		}
+		if waitTimeout > 60*time.Second {
 			waitTimeout = 60 * time.Second
 		}
 		select {
 		case finished := <-waitCh:
 			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(finished)
 			return
 		case <-time.After(waitTimeout):
 			// Timeout reached while waiting
+			h.removeWaiter(queryID, waitCh)
+		case <-r.Context().Done():
+			remaining := h.removeWaiter(queryID, waitCh)
+			if remaining == 0 {
+				h.cancelDispatchedQuery(queryID, targetMem.ID, req.TargetWorkspace, "asker_cancelled")
+			}
+			return
 		}
 	}
 
@@ -726,28 +1163,93 @@ func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 
 func (h *HubServer) handleQueryDetail(w http.ResponseWriter, r *http.Request) {
 	queryID := strings.TrimPrefix(r.URL.Path, "/api/v1/queries/")
+	queryID = strings.TrimSpace(queryID)
 	if queryID == "" {
-		http.Error(w, "missing query id", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "missing query id")
 		return
 	}
 
 	q, err := h.store.GetQuery(r.Context(), queryID)
 	if err != nil {
-		http.Error(w, "query not found", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+			Error: protocol.ErrorDetail{
+				Code:    protocol.ErrCodeNotFound,
+				Message: "query not found",
+			},
+		})
 		return
 	}
 
-	// Authorization verification: only asker, target member, or admin can inspect query detail
+	// Authorization verification: only asker, target member, or admin can inspect query detail (F9)
 	isAdmin := h.authenticateAdmin(r)
 	if !isAdmin {
 		caller, err := h.authenticateMember(r)
 		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+				Error: protocol.ErrorDetail{
+					Code:    protocol.ErrCodeUnauthorized,
+					Message: "unauthorized",
+				},
+			})
 			return
 		}
 		if caller.ID != q.AskerID && caller.ID != q.TargetMemberID {
-			http.Error(w, "forbidden: caller is neither asker nor target", http.StatusForbidden)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(protocol.ErrorResponse{
+				Error: protocol.ErrorDetail{
+					Code:    protocol.ErrCodeForbidden,
+					Message: "forbidden: caller is neither asker nor target",
+				},
+			})
 			return
+		}
+	}
+
+	// Long-polling (?wait=duration)
+	waitParam := r.URL.Query().Get("wait")
+	if waitParam != "" {
+		var waitDur time.Duration
+		if d, err := time.ParseDuration(waitParam); err == nil {
+			waitDur = d
+		} else if sec, err := strconv.Atoi(waitParam); err == nil {
+			waitDur = time.Duration(sec) * time.Second
+		} else {
+			waitDur = 30 * time.Second
+		}
+		if waitDur > 60*time.Second {
+			waitDur = 60 * time.Second
+		}
+		if waitDur <= 0 {
+			waitDur = 30 * time.Second
+		}
+
+		if q.Status == protocol.QueryStatusQueued || q.Status == protocol.QueryStatusDispatched || q.Status == protocol.QueryStatusPending {
+			waitCh := make(chan *protocol.QueryDetailResponse, 1)
+			h.mu.Lock()
+			h.queryWaiters[queryID] = append(h.queryWaiters[queryID], waitCh)
+			h.mu.Unlock()
+
+			select {
+			case finished := <-waitCh:
+				if finished != nil {
+					q = finished
+				} else if latest, err := h.store.GetQuery(r.Context(), queryID); err == nil {
+					q = latest
+				}
+			case <-time.After(waitDur):
+				h.removeWaiter(queryID, waitCh)
+				if latest, err := h.store.GetQuery(r.Context(), queryID); err == nil {
+					q = latest
+				}
+			case <-r.Context().Done():
+				h.removeWaiter(queryID, waitCh)
+				return
+			}
 		}
 	}
 
@@ -758,17 +1260,17 @@ func (h *HubServer) handleQueryDetail(w http.ResponseWriter, r *http.Request) {
 func (h *HubServer) handleAuditInbound(w http.ResponseWriter, r *http.Request) {
 	mem, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	if limit <= 0 {
-		limit = 20
+		limit = 50
 	}
 	resp, err := h.store.GetInboundAudit(r.Context(), mem.ID, limit, offset)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -778,17 +1280,17 @@ func (h *HubServer) handleAuditInbound(w http.ResponseWriter, r *http.Request) {
 func (h *HubServer) handleAuditOutbound(w http.ResponseWriter, r *http.Request) {
 	mem, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	if limit <= 0 {
-		limit = 20
+		limit = 50
 	}
 	resp, err := h.store.GetOutboundAudit(r.Context(), mem.ID, limit, offset)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -798,106 +1300,56 @@ func (h *HubServer) handleAuditOutbound(w http.ResponseWriter, r *http.Request) 
 func (h *HubServer) handleFeishuBindingGet(w http.ResponseWriter, r *http.Request) {
 	mem, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 	binding, err := h.store.GetFeishuBinding(r.Context(), mem.ID)
 	if err != nil {
-		http.Error(w, "binding not found", http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, protocol.ErrCodeNotFound, "binding not found")
 		return
 	}
+	webhookURL := fmt.Sprintf("%s/api/v1/feishu/webhook/%s", h.publicURL(r), mem.ID)
+	resp := protocol.FeishuBindingResponse{
+		Bound:      binding != nil && binding.AppID != "",
+		AppID:      binding.AppID,
+		WebhookURL: webhookURL,
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(binding)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (h *HubServer) handleFeishuBindingSave(w http.ResponseWriter, r *http.Request) {
 	mem, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 	var req protocol.FeishuBindingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "invalid json")
 		return
 	}
 	if err := h.store.SaveFeishuBinding(r.Context(), mem.ID, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	webhookURL := fmt.Sprintf("%s/api/v1/feishu/webhook/%s", h.publicURL(r), mem.ID)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success":     true,
+		"webhook_url": webhookURL,
+	})
 }
 
 func (h *HubServer) handleFeishuBindingDelete(w http.ResponseWriter, r *http.Request) {
 	mem, err := h.authenticateMember(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
 	if err := h.store.DeleteFeishuBinding(r.Context(), mem.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *HubServer) handleFeishuWebhook(w http.ResponseWriter, r *http.Request) {
-	memberID := strings.TrimPrefix(r.URL.Path, "/api/v1/feishu/webhook/")
-	if memberID == "" {
-		http.Error(w, "missing member id in webhook path", http.StatusBadRequest)
-		return
-	}
-
-	binding, err := h.store.GetFeishuBinding(r.Context(), memberID)
-	if err != nil {
-		http.Error(w, "feishu binding not found for member", http.StatusNotFound)
-		return
-	}
-
-	rawBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body failed", http.StatusBadRequest)
-		return
-	}
-
-	// 1. Signature and Timestamp verification
-	timestamp := r.Header.Get("X-Lark-Request-Timestamp")
-	nonce := r.Header.Get("X-Lark-Request-Nonce")
-	signature := r.Header.Get("X-Lark-Signature")
-
-	if binding.EncryptKey != "" && signature != "" {
-		if !feishu.VerifyTimestampFreshness(timestamp, 300) {
-			http.Error(w, "expired timestamp", http.StatusUnauthorized)
-			return
-		}
-		if !feishu.VerifySignature(timestamp, nonce, binding.EncryptKey, rawBody, signature) {
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	var parsed map[string]any
-	if err := json.Unmarshal(rawBody, &parsed); err != nil {
-		http.Error(w, "invalid json payload", http.StatusBadRequest)
-		return
-	}
-
-	// 2. URL Verification Challenge
-	if challenge, ok := parsed["challenge"].(string); ok {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": challenge})
-		return
-	}
-
-	// 3. Encrypted event payload handling
-	if encryptData, ok := parsed["encrypt"].(string); ok && binding.EncryptKey != "" {
-		plainBytes, err := feishu.DecryptPayload(encryptData, binding.EncryptKey)
-		if err != nil {
-			http.Error(w, "payload decryption failed", http.StatusBadRequest)
-			return
-		}
-		_ = json.Unmarshal(plainBytes, &parsed)
-	}
-
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusNoContent)
 }

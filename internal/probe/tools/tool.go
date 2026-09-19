@@ -45,6 +45,15 @@ type Registry struct {
 // NewRegistry creates a registry populated with default read-only tools.
 func NewRegistry() *Registry {
 	r := &Registry{tools: make(map[string]Tool)}
+	r.Register(&GitStatusTool{})
+	r.Register(&GitDiffTool{})
+	r.Register(&GitLogTool{})
+	r.Register(&ListDirTool{})
+	r.Register(&ReadFileTool{})
+	r.Register(&GrepSearchTool{})
+	r.Register(&RecentFilesTool{})
+	r.Register(&ListeningPortsTool{})
+	r.Register(&FindAPISpecsTool{})
 	return r
 }
 
@@ -69,11 +78,12 @@ func (r *Registry) List() []Tool {
 }
 
 func normalizeVolume(path string) string {
-	vol := filepath.VolumeName(path)
+	p := strings.TrimPrefix(path, `\\?\`)
+	vol := filepath.VolumeName(p)
 	if vol == "" {
-		return path
+		return p
 	}
-	return strings.ToUpper(vol) + path[len(vol):]
+	return strings.ToUpper(vol) + p[len(vol):]
 }
 
 // resolvePhysicalPath resolves symbolic links for target.

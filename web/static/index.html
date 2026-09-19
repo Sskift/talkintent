@@ -4,401 +4,394 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TalkIntent 研发协同感知控制台</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
-      --success: #10b981;
-      --danger: #ef4444;
-      --code-bg: #090d16;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background-color: var(--bg); color: var(--text); padding: 24px; }
-    .container { max-width: 1100px; margin: 0 auto; }
-    header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 24px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
-    h1 { font-size: 24px; font-weight: 600; }
-    .subtitle { color: var(--text-muted); font-size: 14px; margin-top: 4px; }
-    .nav { display: flex; gap: 12px; margin-bottom: 24px; }
-    .nav button { background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
-    .nav button.active { background: var(--primary); border-color: var(--primary); }
-    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-    th, td { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
-    th { color: var(--text-muted); font-weight: 500; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 12px; font-weight: 500; }
-    .badge-online { background: rgba(16, 185, 129, 0.2); color: var(--success); }
-    .badge-offline { background: rgba(148, 163, 184, 0.2); color: var(--text-muted); }
-    .form-group { margin-bottom: 16px; }
-    label { display: block; font-size: 14px; color: var(--text-muted); margin-bottom: 6px; }
-    input[type="text"], input[type="password"] { width: 100%; background: #0f172a; border: 1px solid var(--border); padding: 10px; border-radius: 6px; color: #fff; }
-    button.btn-primary { background: var(--primary); color: #fff; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 500; }
-    button.btn-primary:hover { background: var(--primary-hover); }
-    button.btn-sm { padding: 4px 10px; font-size: 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--card-bg); color: var(--text); cursor: pointer; }
-    .answer-box { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: monospace; white-space: pre-wrap; font-size: 13px; margin-top: 8px; max-height: 200px; overflow-y: auto; }
-  </style>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="container">
     <header>
-      <div>
+      <div class="header-brand">
         <h1>TalkIntent 研发协同感知控制台</h1>
         <div class="subtitle">分布式现场 Agent 探针 + 中心 Hub 异步感知系统</div>
       </div>
-      <div id="auth-status">
-        <span class="badge badge-offline" id="user-badge">未登录</span>
+      <div class="auth-bar" id="auth-status">
+        <div class="user-badge-wrapper">
+          <span class="badge badge-offline" id="user-badge">未登录</span>
+          <span id="user-info-text" style="font-size: 13px; color: var(--text-muted); display: none;"></span>
+        </div>
+        <button class="btn btn-sm btn-primary" id="btn-open-login" onclick="openLoginModal()">登录 / 切换 Token</button>
+        <button class="btn btn-sm btn-secondary" id="btn-logout" onclick="logout()" style="display: none;">退出</button>
       </div>
     </header>
 
     <div class="nav">
-      <button class="active" onclick="showTab('members')">成员与在线状态</button>
-      <button onclick="showTab('inbound')">谁查了我 (Inbound 审计)</button>
-      <button onclick="showTab('outbound')">我的提问 (Outbound 审计)</button>
-      <button onclick="showTab('feishu')">飞书 Bot 绑定</button>
-      <button onclick="showTab('admin')">邀请码生成 (Admin)</button>
+      <button class="active" id="nav-btn-members" onclick="showTab('members')">成员与在线状态</button>
+      <button id="nav-btn-inbound" onclick="showTab('inbound')">谁查了我 (Inbound 审计)</button>
+      <button id="nav-btn-outbound" onclick="showTab('outbound')">我的提问 (Outbound 审计)</button>
+      <button id="nav-btn-ask" onclick="showTab('ask')">发起提问</button>
+      <button id="nav-btn-detail" onclick="showTab('detail')">Query 详情时间线</button>
+      <button id="nav-btn-feishu" onclick="showTab('feishu')">飞书 Bot 绑定</button>
+      <button id="nav-btn-admin" onclick="showTab('admin')">邀请码生成 (Admin)</button>
     </div>
 
     <!-- Members Tab -->
     <div id="tab-members" class="card tab-content">
-      <h2>团队成员列表</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>姓名</th>
-            <th>别名</th>
-            <th>在线状态</th>
-            <th>主机名称</th>
-            <th>监控工作区</th>
-            <th>飞书 Bot</th>
-          </tr>
-        </thead>
-        <tbody id="members-table-body">
-          <tr><td colspan="6" style="text-align:center; color: var(--text-muted);">加载中...</td></tr>
-        </tbody>
-      </table>
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">团队成员列表</h2>
+          <div class="card-subtitle">实时查看已注册团队成员、工作区与现场探针连接状态</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span id="members-count" class="badge badge-dispatched">0 成员</span>
+          <button class="btn btn-sm btn-secondary" id="btn-refresh-members" onclick="loadMembers()">刷新列表</button>
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>姓名</th>
+              <th>别名</th>
+              <th>在线状态</th>
+              <th>最后活跃</th>
+              <th>主机名称</th>
+              <th>监控工作区</th>
+              <th>飞书 Bot</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="members-table-body">
+            <tr><td colspan="8" style="text-align:center; color: var(--text-muted);">正在加载成员列表...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <datalist id="members-datalist"></datalist>
     </div>
 
     <!-- Inbound Audit Tab -->
     <div id="tab-inbound" class="card tab-content" style="display:none;">
-      <h2>Inbound 访问审计 (谁向我的现场发起了 Query)</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>时间</th>
-            <th>提问人</th>
-            <th>提问内容</th>
-            <th>探针回答</th>
-            <th>状态</th>
-            <th>调用工具</th>
-            <th>耗时</th>
-          </tr>
-        </thead>
-        <tbody id="inbound-table-body">
-          <tr><td colspan="7" style="text-align:center; color: var(--text-muted);">暂无记录</td></tr>
-        </tbody>
-      </table>
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Inbound 访问审计 (谁向我的现场发起了 Query)</h2>
+          <div class="card-subtitle">完整记录对您本地工作区的现场探查请求、调用的探针工具与最终披露的合成回答</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span id="inbound-count" class="badge badge-dispatched">0 记录</span>
+          <button class="btn btn-sm btn-secondary" id="btn-refresh-inbound" onclick="loadInboundAudit()">刷新审计</button>
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>提问人</th>
+              <th>提问内容</th>
+              <th>探针回答</th>
+              <th>状态</th>
+              <th>调用工具</th>
+              <th>耗时</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="inbound-table-body">
+            <tr><td colspan="8" style="text-align:center; color: var(--text-muted);">暂无 Inbound 审计记录</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
 
     <!-- Outbound Audit Tab -->
     <div id="tab-outbound" class="card tab-content" style="display:none;">
-      <h2>Outbound 提问历史 (我发起的 Query)</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>时间</th>
-            <th>被问成员</th>
-            <th>问题</th>
-            <th>回答内容</th>
-            <th>状态</th>
-          </tr>
-        </thead>
-        <tbody id="outbound-table-body">
-          <tr><td colspan="5" style="text-align:center; color: var(--text-muted);">暂无记录</td></tr>
-        </tbody>
-      </table>
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Outbound 提问历史 (我发起的 Query)</h2>
+          <div class="card-subtitle">查看您向其他团队成员发起的感知提问及探针反馈的历史记录</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span id="outbound-count" class="badge badge-dispatched">0 记录</span>
+          <button class="btn btn-sm btn-secondary" id="btn-refresh-outbound" onclick="loadOutboundAudit()">刷新审计</button>
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>被问成员</th>
+              <th>问题</th>
+              <th>回答内容</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="outbound-table-body">
+            <tr><td colspan="6" style="text-align:center; color: var(--text-muted);">暂无 Outbound 提问记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Ask Form Tab -->
+    <div id="tab-ask" class="card tab-content" style="display:none;">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">发起协同感知提问</h2>
+          <div class="card-subtitle">向指定同事的现场 Agent 探针提问，系统将通过 Hub 实时调度探针并返回合成回答</div>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="ask-target">目标成员姓名或别名 <span class="required">*</span></label>
+          <input type="text" id="ask-target" list="members-datalist" placeholder="例如: 张三 或 zhangsan">
+          <div class="input-hint">可输入成员姓名或别名，支持下拉联想推荐</div>
+        </div>
+        <div class="form-group">
+          <label for="ask-workspace">目标工作区 (可选)</label>
+          <input type="text" id="ask-workspace" placeholder="留空则由探针自动匹配">
+          <div class="input-hint">若目标注册了多个工作区，可指定要检查的项目名称</div>
+        </div>
+        <div class="form-group" style="max-width: 140px;">
+          <label for="ask-timeout">超时时间 (秒)</label>
+          <input type="number" id="ask-timeout" value="60" min="10" max="300">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="ask-query">提问内容 <span class="required">*</span></label>
+        <textarea id="ask-query" placeholder="例如：问一下张三现在登录模块重构得怎么样了，完成了哪些接口？"></textarea>
+      </div>
+
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <button class="btn btn-primary" id="ask-submit-btn" onclick="submitAskQuery()">提交并等待回答</button>
+        <button class="btn btn-secondary" id="ask-cancel-btn" onclick="cancelAskPoll()" style="display:none;">停止等待</button>
+      </div>
+
+      <!-- Ambiguous Candidates Selection -->
+      <div id="ask-candidates" style="display: none; margin-top: 16px; padding: 14px; background: rgba(245, 158, 11, 0.1); border: 1px solid var(--warning); border-radius: var(--radius);">
+        <div style="font-size: 13px; color: var(--warning); font-weight: 600; margin-bottom: 6px;">匹配到多个同名或别名候选人，请点击选择具体成员：</div>
+        <div class="candidate-list" id="ask-candidates-list"></div>
+      </div>
+
+      <!-- Live Polling Progress Box -->
+      <div id="ask-progress" class="polling-box" style="display:none;">
+        <span class="spinner"></span>
+        <span id="ask-progress-text">正在向现场探针调度查询...</span>
+      </div>
+
+      <!-- Result Card -->
+      <div id="ask-result" style="display:none; margin-top: 20px; border-top: 1px solid var(--border); padding-top: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="badge" id="ask-status-badge">status</span>
+            <span id="ask-duration" style="font-size: 12px; color: var(--text-muted);"></span>
+            <span id="ask-tokens" style="font-size: 12px; color: var(--text-muted);"></span>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-sm btn-secondary" id="ask-copy-btn" onclick="copyText('', 'ask-copy-btn')">复制回答</button>
+            <button class="btn btn-sm btn-primary" id="ask-detail-btn" onclick="viewQueryDetail('')">查看详情时间线</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 8px;">
+          <span style="font-size: 12px; color: var(--text-muted); margin-right: 6px;">现场探针调用工具:</span>
+          <span id="ask-tools"></span>
+        </div>
+
+        <div class="answer-box" id="ask-answer"></div>
+      </div>
+    </div>
+
+    <!-- Query Detail Timeline Tab -->
+    <div id="tab-detail" class="card tab-content" style="display:none;">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Query 执行详情与时间线</h2>
+          <div class="card-subtitle">查看 Query 从创建、队列缓冲、WebSocket 派发、探针工具调用到最终合成的完整生命周期</div>
+        </div>
+      </div>
+
+      <div class="form-row" style="align-items: flex-end; margin-bottom: 20px;">
+        <div class="form-group" style="flex: 1;">
+          <label for="detail-query-id">Query ID</label>
+          <input type="text" id="detail-query-id" placeholder="qry_01J8QRY999...">
+        </div>
+        <div class="form-group" style="max-width: 140px;">
+          <button class="btn btn-primary" id="detail-fetch-btn" onclick="fetchQueryDetail()" style="width: 100%;">查询详情</button>
+        </div>
+      </div>
+
+      <div id="detail-container" style="display: none;">
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-value"><span class="badge" id="detail-status">-</span></div>
+            <div class="metric-label">当前状态</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-value" id="detail-duration">-</div>
+            <div class="metric-label">执行耗时</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-value" id="detail-origin">-</div>
+            <div class="metric-label">请求来源</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-value" id="detail-workspace">-</div>
+            <div class="metric-label">目标工作区</div>
+          </div>
+        </div>
+
+        <div class="card" style="background: rgba(15, 23, 42, 0.4); margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+            <div style="font-size: 13px; color: var(--text-muted);">
+              <strong>提问人:</strong> <span id="detail-asker">-</span> &nbsp;→&nbsp;
+              <strong>被问成员:</strong> <span id="detail-target">-</span>
+            </div>
+            <div id="detail-tokens" style="font-size: 13px; color: var(--text-muted);"></div>
+          </div>
+          <div style="font-size: 14px; font-weight: 500; color: var(--text); padding: 8px 0;" id="detail-query-text"></div>
+        </div>
+
+        <h3 style="font-size: 15px; font-weight: 600; margin: 16px 0 8px 0;">生命周期时间线</h3>
+        <div class="timeline" id="detail-timeline"></div>
+
+        <div style="margin: 16px 0 8px 0;">
+          <span style="font-size: 13px; font-weight: 600; color: var(--text); margin-right: 8px;">调用探针工具:</span>
+          <span id="detail-tools"></span>
+        </div>
+
+        <div id="detail-error" style="display:none; margin: 14px 0; padding: 12px; background: var(--danger-subtle); border: 1px solid var(--danger); border-radius: var(--radius); color: #fca5a5; font-size: 13px;"></div>
+
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
+          <span style="font-size: 14px; font-weight: 600;">探针合成回答:</span>
+          <button class="btn btn-sm btn-secondary" id="detail-copy-btn" onclick="copyText('', 'detail-copy-btn')">复制回答</button>
+        </div>
+        <div class="answer-box" id="detail-answer" style="max-height: 400px;"></div>
+      </div>
     </div>
 
     <!-- Feishu Tab -->
     <div id="tab-feishu" class="card tab-content" style="display:none;">
-      <h2>个人专属飞书 Bot 凭据绑定</h2>
-      <div class="subtitle" style="margin-bottom: 20px;">配置您在飞书开放平台创建的自建应用，其他人可通过飞书向您的专属 Bot 提问。</div>
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">个人专属飞书 Bot 凭据绑定</h2>
+          <div class="card-subtitle">配置您在飞书开放平台创建的自建应用，其他人可通过飞书向您的专属 Bot 提问。凭据采用 AES-GCM 安全加密存储。</div>
+        </div>
+        <button class="btn btn-sm btn-secondary" id="btn-refresh-feishu" onclick="loadFeishuBinding()">刷新状态</button>
+      </div>
+
+      <!-- Bound Status Card -->
+      <div id="fs-bound-card" style="margin-bottom: 24px; padding: 16px; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius); display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="badge badge-success" id="fs-status-badge">已绑定飞书应用</span>
+          </div>
+          <button class="btn btn-sm btn-danger" id="fs-delete-btn" onclick="deleteFeishuBinding()">解绑 / 删除配置</button>
+        </div>
+        <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 6px;">飞书开放平台事件订阅请求网址 (Webhook URL):</div>
+        <div class="copy-box">
+          <input type="text" id="fs-webhook-url" readonly>
+          <button class="btn btn-sm btn-primary" id="fs-copy-webhook-btn" onclick="copyText('', 'fs-copy-webhook-btn')">复制 URL</button>
+        </div>
+        <div style="font-size: 12px; color: var(--text-subtle); margin-top: 8px;">
+          请在飞书开放平台「事件订阅」中填入上述请求网址，并添加事件 <code>im.message.receive_v1</code> (接收消息 v2.0)。
+        </div>
+      </div>
+
       <div class="form-group">
-        <label>App ID</label>
+        <label for="fs-app-id">App ID <span class="required">*</span></label>
         <input type="text" id="fs-app-id" placeholder="cli_xxxxxxxxxxxxx">
+        <div class="input-hint">飞书开放平台应用的 App ID</div>
       </div>
       <div class="form-group">
-        <label>App Secret</label>
+        <label for="fs-app-secret">App Secret <span class="required">*</span></label>
         <input type="password" id="fs-app-secret" placeholder="••••••••••••••••">
+        <div class="input-hint">用于换取 tenant_access_token 以回复私聊消息</div>
       </div>
       <div class="form-group">
-        <label>Verification Token</label>
+        <label for="fs-token">Verification Token <span class="required">*</span></label>
         <input type="text" id="fs-token" placeholder="v_xxxxxxxxxxxx">
+        <div class="input-hint">事件订阅验证 Token</div>
       </div>
       <div class="form-group">
-        <label>Encrypt Key</label>
-        <input type="password" id="fs-encrypt-key" placeholder="••••••••••••••••">
+        <label for="fs-encrypt-key">Encrypt Key (可选)</label>
+        <input type="password" id="fs-encrypt-key" placeholder="若开启了事件加密则必填">
+        <div class="input-hint">用于解密挑战和回调消息 payload</div>
       </div>
-      <button class="btn-primary" onclick="saveFeishuBinding()">保存飞书配置</button>
-      <div id="feishu-result" style="margin-top: 12px; font-size: 14px;"></div>
+
+      <button class="btn btn-primary" id="fs-save-btn" onclick="saveFeishuBinding()">保存飞书配置</button>
+      <div id="fs-result" style="margin-top: 14px; font-size: 14px;"></div>
     </div>
 
     <!-- Admin Tab -->
     <div id="tab-admin" class="card tab-content" style="display:none;">
-      <h2>生成成员配对邀请码</h2>
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">生成成员配对邀请码 (Admin)</h2>
+          <div class="card-subtitle">管理员为新团队成员生成一次性配对邀请码，开发者在本地使用 CLI 即可快速接入</div>
+        </div>
+      </div>
+
       <div class="form-group">
-        <label>管理员 Token (Admin Token)</label>
+        <label for="admin-token">管理员 Token (Admin Token) <span class="required">*</span></label>
         <input type="password" id="admin-token" placeholder="ti_adm_...">
+        <div class="input-hint">Hub 服务端启动时输出的管理员凭据，保存在本地仅用于 Admin 操作</div>
       </div>
       <div class="form-group">
-        <label>成员姓名</label>
-        <input type="text" id="inv-name" placeholder="例如: 张三">
+        <label for="inv-name">成员姓名 <span class="required">*</span></label>
+        <input type="text" id="inv-name" placeholder="例如: 王五">
       </div>
       <div class="form-group">
-        <label>别名 (逗号分隔)</label>
-        <input type="text" id="inv-aliases" placeholder="例如: zhangsan, 三哥">
+        <label for="inv-aliases">别名 (逗号分隔，可选)</label>
+        <input type="text" id="inv-aliases" placeholder="例如: wangwu, 小王, ww">
       </div>
-      <button class="btn-primary" onclick="generateInvite()">生成邀请码</button>
-      <div id="invite-result" style="margin-top: 16px; font-weight: 600; color: var(--success);"></div>
+      <div class="form-group">
+        <label for="inv-expires">有效期 (小时)</label>
+        <input type="number" id="inv-expires" value="48" min="1" max="720">
+      </div>
+
+      <button class="btn btn-primary" id="inv-submit-btn" onclick="generateInvite()">生成邀请码</button>
+
+      <div id="invite-result" style="margin-top: 20px; display: none;">
+        <div style="font-size: 14px; color: var(--text-muted); margin-bottom: 6px;">生成的成员配对邀请码:</div>
+        <div class="code-display">
+          <span id="invite-code-display">INV-XXXX-XXXX</span>
+          <button class="btn btn-sm btn-secondary" id="invite-copy-btn" onclick="copyText('', 'invite-copy-btn')">复制邀请码</button>
+        </div>
+        <div style="font-size: 13px; color: var(--text-muted); margin-top: 12px; margin-bottom: 6px;">开发者本地配对命令:</div>
+        <div class="copy-box">
+          <input type="text" id="invite-command-display" readonly>
+          <button class="btn btn-sm btn-primary" id="invite-copy-cmd-btn" onclick="copyText('', 'invite-copy-cmd-btn')">复制配对命令</button>
+        </div>
+      </div>
     </div>
   </div>
 
-  <script>
-    function getToken() {
-      // 1. Check URL hash fragment (#token=...)
-      const hash = window.location.hash;
-      if (hash && hash.includes('token=')) {
-        const match = hash.match(/token=([^&]+)/);
-        if (match && match[1]) {
-          const t = match[1];
-          sessionStorage.setItem('talkintent_token', t);
-          history.replaceState(null, "", window.location.pathname);
-          return t;
-        }
-      }
-      return sessionStorage.getItem('talkintent_token') || "";
-    }
+  <!-- Login Modal Dialog -->
+  <div class="modal-backdrop" id="login-modal" style="display: none;">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">登录 TalkIntent 控制台</div>
+        <button class="btn-sm" onclick="closeLoginModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="token-input">Member Token <span class="required">*</span></label>
+          <input type="password" id="token-input" placeholder="ti_mem_...">
+          <div class="input-hint">输入配对成功后获得的成员凭证。Token 将安全保存在本地 localStorage 中，仅在 Authorization 标头中发送。</div>
+        </div>
+        <div id="login-msg" style="font-size: 13px; color: var(--danger); margin-top: 8px;"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="btn-login-cancel" onclick="closeLoginModal()">取消</button>
+        <button class="btn btn-primary" id="btn-login-submit" onclick="login()">登录</button>
+      </div>
+    </div>
+  </div>
 
-    function authHeaders() {
-      const token = getToken();
-      const headers = { 'Content-Type': 'application/json' };
-      if (token) {
-        headers['Authorization'] = 'Bearer ' + token;
-      }
-      return headers;
-    }
+  <!-- Floating Toast Notifications -->
+  <div class="toast-container" id="toast-container"></div>
 
-    function showTab(name) {
-      document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
-      document.querySelectorAll('.nav button').forEach(el => el.classList.remove('active'));
-      const target = document.getElementById('tab-' + name);
-      if (target) target.style.display = 'block';
-      if (event && event.target) event.target.classList.add('active');
-
-      if (name === 'members') loadMembers();
-      if (name === 'inbound') loadInboundAudit();
-      if (name === 'outbound') loadOutboundAudit();
-      if (name === 'feishu') loadFeishuBinding();
-    }
-
-    async function checkAuth() {
-      const token = getToken();
-      if (!token) return;
-      try {
-        const res = await fetch('/api/v1/members/me', { headers: authHeaders() });
-        if (res.ok) {
-          const me = await res.json();
-          document.getElementById('user-badge').className = 'badge badge-online';
-          document.getElementById('user-badge').innerText = me.name + ' (' + me.id + ')';
-        }
-      } catch (err) {}
-    }
-
-    async function loadMembers() {
-      try {
-        const res = await fetch('/api/v1/members', { headers: authHeaders() });
-        if (!res.ok) return;
-        const data = await res.json();
-        const tbody = document.getElementById('members-table-body');
-        if (!data.members || data.members.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">暂无注册成员</td></tr>';
-          return;
-        }
-        tbody.innerHTML = data.members.map(m => `
-          <tr>
-            <td><strong>${escapeHtml(m.name)}</strong></td>
-            <td>${escapeHtml((m.aliases || []).join(', ') || '-')}</td>
-            <td><span class="badge ${m.online ? 'badge-online' : 'badge-offline'}">${m.online ? '在线' : '离线'}</span></td>
-            <td>${escapeHtml(m.machine_name || '-')}</td>
-            <td>${escapeHtml((m.workspaces || []).join(', ') || '-')}</td>
-            <td>${m.has_feishu_bot ? '已绑定' : '未绑定'}</td>
-          </tr>
-        `).join('');
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function loadInboundAudit() {
-      try {
-        const res = await fetch('/api/v1/audit/inbound', { headers: authHeaders() });
-        const tbody = document.getElementById('inbound-table-body');
-        if (!res.ok) {
-          tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color: var(--danger);">需要登录后查看</td></tr>';
-          return;
-        }
-        const data = await res.json();
-        if (!data.entries || data.entries.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">暂无 Inbound 审计记录</td></tr>';
-          return;
-        }
-        tbody.innerHTML = data.entries.map((e, idx) => `
-          <tr>
-            <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
-            <td>${escapeHtml(e.asker_name)}</td>
-            <td>${escapeHtml(e.query)}</td>
-            <td>
-              <button class="btn-sm" onclick="toggleAnswer('ans-${idx}')">查看回答</button>
-              <div id="ans-${idx}" class="answer-box" style="display:none;">${escapeHtml(e.answer || '(暂无回答或执行中)')}</div>
-            </td>
-            <td><span class="badge ${e.status === 'completed' ? 'badge-online' : 'badge-offline'}">${e.status}</span></td>
-            <td>${escapeHtml((e.tools_used || []).join(', ') || '-')}</td>
-            <td>${e.duration_ms}ms</td>
-          </tr>
-        `).join('');
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function loadOutboundAudit() {
-      try {
-        const res = await fetch('/api/v1/audit/outbound', { headers: authHeaders() });
-        const tbody = document.getElementById('outbound-table-body');
-        if (!res.ok) {
-          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--danger);">需要登录后查看</td></tr>';
-          return;
-        }
-        const data = await res.json();
-        if (!data.entries || data.entries.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">暂无 Outbound 审计记录</td></tr>';
-          return;
-        }
-        tbody.innerHTML = data.entries.map((e, idx) => `
-          <tr>
-            <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
-            <td>${escapeHtml(e.target_member_name)}</td>
-            <td>${escapeHtml(e.query)}</td>
-            <td>
-              <button class="btn-sm" onclick="toggleAnswer('out-ans-${idx}')">查看回答</button>
-              <div id="out-ans-${idx}" class="answer-box" style="display:none;">${escapeHtml(e.answer || '(暂无回答或执行中)')}</div>
-            </td>
-            <td><span class="badge ${e.status === 'completed' ? 'badge-online' : 'badge-offline'}">${e.status}</span></td>
-          </tr>
-        `).join('');
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function loadFeishuBinding() {
-      try {
-        const res = await fetch('/api/v1/feishu/binding', { headers: authHeaders() });
-        if (res.ok) {
-          const b = await res.json();
-          document.getElementById('fs-app-id').value = b.app_id || '';
-          document.getElementById('fs-token').value = b.verification_token || '';
-        }
-      } catch (err) {}
-    }
-
-    async function saveFeishuBinding() {
-      const payload = {
-        app_id: document.getElementById('fs-app-id').value.trim(),
-        app_secret: document.getElementById('fs-app-secret').value.trim(),
-        verification_token: document.getElementById('fs-token').value.trim(),
-        encrypt_key: document.getElementById('fs-encrypt-key').value.trim(),
-      };
-      const resultEl = document.getElementById('feishu-result');
-      try {
-        const res = await fetch('/api/v1/feishu/binding', {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify(payload),
-        });
-        if (res.ok) {
-          resultEl.style.color = 'var(--success)';
-          resultEl.innerText = '飞书配置已安全保存 (AES-GCM 加密存储)。';
-        } else {
-          resultEl.style.color = 'var(--danger)';
-          resultEl.innerText = '保存失败: HTTP ' + res.status;
-        }
-      } catch (err) {
-        resultEl.style.color = 'var(--danger)';
-        resultEl.innerText = '请求异常: ' + err.message;
-      }
-    }
-
-    async function generateInvite() {
-      const adminToken = document.getElementById('admin-token').value.trim();
-      const name = document.getElementById('inv-name').value.trim();
-      const aliasesRaw = document.getElementById('inv-aliases').value.trim();
-      const aliases = aliasesRaw ? aliasesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
-
-      const resultEl = document.getElementById('invite-result');
-      if (!name) {
-        resultEl.style.color = 'var(--danger)';
-        resultEl.innerText = '请填写成员姓名';
-        return;
-      }
-
-      try {
-        const res = await fetch('/api/v1/admin/invites', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + (adminToken || getToken()),
-          },
-          body: JSON.stringify({
-            target_name: name,
-            aliases: aliases,
-            expires_in_hours: 48,
-          }),
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-          resultEl.style.color = 'var(--success)';
-          resultEl.innerHTML = `配对邀请码生成成功: <span style="user-select:all; background:#334155; padding:4px 8px; border-radius:4px;">${data.code}</span> (有效期 48 小时)`;
-        } else {
-          resultEl.style.color = 'var(--danger)';
-          resultEl.innerText = '生成失败: HTTP ' + res.status + ' (请确认管理员 Token 正确)';
-        }
-      } catch (err) {
-        resultEl.style.color = 'var(--danger)';
-        resultEl.innerText = '请求异常: ' + err.message;
-      }
-    }
-
-    function toggleAnswer(id) {
-      const el = document.getElementById(id);
-      if (el) {
-        el.style.display = el.style.display === 'none' ? 'block' : 'none';
-      }
-    }
-
-    function escapeHtml(text) {
-      if (!text) return '';
-      return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    }
-
-    window.onload = function() {
-      checkAuth();
-      loadMembers();
-    };
-  </script>
+  <script src="app.js"></script>
 </body>
 </html>

@@ -111,15 +111,19 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 
 	// 1. Boot In-Process Mock LLM
 	mockServer := mockllm.NewServerWithOptions(mockllm.WithMode(mockllm.ModeOpenAI))
-	defer mockServer.Close()
+	t.Cleanup(mockServer.Close)
 
 	// 2. Boot In-Process Hub Server on dynamic port (:0)
+	// Teardown is registered with t.Cleanup. Cleanups run LIFO, so the daemons
+	// (registered later) stop first, then the hub, then the store, and t.TempDir's
+	// RemoveAll (registered first) runs last. Nothing is still writing when the
+	// temp tree is removed.
 	hubDataDir := t.TempDir()
 	st, err := store.NewJSONLStore(hubDataDir)
 	if err != nil {
 		t.Fatalf("failed to create JSONL store: %v", err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { _ = st.Close() })
 
 	hubCfg := &config.HubConfig{
 		Addr:    "127.0.0.1:0",
@@ -130,9 +134,15 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 		t.Fatalf("failed to create hub server: %v", err)
 	}
 
+	hubDone := make(chan struct{})
 	go func() {
+		defer close(hubDone)
 		_ = hubServer.Start(ctx)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		<-hubDone
+	})
 
 	// Wait for Hub to bind and begin listening
 	var hubURL string
@@ -241,8 +251,10 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 	_ = daveToken
 	_ = daveID
 
-	// Helper to spawn a ClientDaemon
-	startDaemon := func(name, memberToken, memberID, repoDir string, cancelCtx context.Context) *daemon.ClientDaemon {
+	// Helper to spawn a ClientDaemon. The daemon is stopped via t.Cleanup on the
+	// given t (so Carol, started inside a subtest, is torn down with that subtest):
+	// Start's exit path writes a final status file, so the test must outlive it.
+	startDaemon := func(t *testing.T, name, memberToken, memberID, repoDir string, cancelCtx context.Context) *daemon.ClientDaemon {
 		clientCfg := &config.ClientConfig{
 			HubURL:   hubURL,
 			Token:    memberToken,
@@ -271,22 +283,25 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 			t.Fatalf("failed to create client daemon for %s: %v", name, err)
 		}
 		d.SetBackoffParams(20*time.Millisecond, 100*time.Millisecond, 1*time.Second)
-		d.SetFilePaths(filepath.Join(t.TempDir(), "status.json"), filepath.Join(t.TempDir(), "daemon.pid"))
+		d.SetDrainGrace(2 * time.Second)
+		daemonDir := t.TempDir()
+		d.SetFilePaths(filepath.Join(daemonDir, "status.json"), filepath.Join(daemonDir, "daemon.pid"))
 
 		go func() {
 			_ = d.Start(cancelCtx)
 		}()
+		t.Cleanup(func() { _ = d.Stop() })
 		return d
 	}
 
 	// Start Daemons for Alice and Bob immediately
 	aliceCtx, cancelAlice := context.WithCancel(ctx)
 	defer cancelAlice()
-	_ = startDaemon("alice", aliceToken, aliceID, aliceRepoDir, aliceCtx)
+	_ = startDaemon(t, "alice", aliceToken, aliceID, aliceRepoDir, aliceCtx)
 
 	bobCtx, cancelBob := context.WithCancel(ctx)
 	defer cancelBob()
-	_ = startDaemon("bob", bobToken, bobID, bobRepoDir, bobCtx)
+	_ = startDaemon(t, "bob", bobToken, bobID, bobRepoDir, bobCtx)
 
 	// Poll Hub until Alice and Bob both report online: true (addresses finding: avoid fixed sleep)
 	pollStart := time.Now()
@@ -479,7 +494,7 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 		// Now launch Carol's daemon!
 		carolCtx, cancelCarol := context.WithCancel(ctx)
 		defer cancelCarol()
-		_ = startDaemon("carol", carolToken, carolID, carolRepoDir, carolCtx)
+		_ = startDaemon(t, "carol", carolToken, carolID, carolRepoDir, carolCtx)
 
 		// Long-poll query status until Carol's daemon drains the queue and completes it
 		var finalDetail protocol.QueryDetailResponse

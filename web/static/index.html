@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TalkIntent 研发协同感知控制台</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --success: #10b981;
+      --danger: #ef4444;
+      --code-bg: #090d16;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); padding: 24px; }
+    .container { max-width: 1100px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 24px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+    h1 { font-size: 24px; font-weight: 600; }
+    .subtitle { color: var(--text-muted); font-size: 14px; margin-top: 4px; }
+    .nav { display: flex; gap: 12px; margin-bottom: 24px; }
+    .nav button { background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    .nav button.active { background: var(--primary); border-color: var(--primary); }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+    th { color: var(--text-muted); font-weight: 500; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 12px; font-weight: 500; }
+    .badge-online { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+    .badge-offline { background: rgba(148, 163, 184, 0.2); color: var(--text-muted); }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-size: 14px; color: var(--text-muted); margin-bottom: 6px; }
+    input[type="text"], input[type="password"] { width: 100%; background: #0f172a; border: 1px solid var(--border); padding: 10px; border-radius: 6px; color: #fff; }
+    button.btn-primary { background: var(--primary); color: #fff; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 500; }
+    button.btn-primary:hover { background: var(--primary-hover); }
+    button.btn-sm { padding: 4px 10px; font-size: 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--card-bg); color: var(--text); cursor: pointer; }
+    .answer-box { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: monospace; white-space: pre-wrap; font-size: 13px; margin-top: 8px; max-height: 200px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>TalkIntent 研发协同感知控制台</h1>
+        <div class="subtitle">分布式现场 Agent 探针 + 中心 Hub 异步感知系统</div>
+      </div>
+      <div id="auth-status">
+        <span class="badge badge-offline" id="user-badge">未登录</span>
+      </div>
+    </header>
+
+    <div class="nav">
+      <button class="active" onclick="showTab('members')">成员与在线状态</button>
+      <button onclick="showTab('inbound')">谁查了我 (Inbound 审计)</button>
+      <button onclick="showTab('outbound')">我的提问 (Outbound 审计)</button>
+      <button onclick="showTab('feishu')">飞书 Bot 绑定</button>
+      <button onclick="showTab('admin')">邀请码生成 (Admin)</button>
+    </div>
+
+    <!-- Members Tab -->
+    <div id="tab-members" class="card tab-content">
+      <h2>团队成员列表</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>姓名</th>
+            <th>别名</th>
+            <th>在线状态</th>
+            <th>主机名称</th>
+            <th>监控工作区</th>
+            <th>飞书 Bot</th>
+          </tr>
+        </thead>
+        <tbody id="members-table-body">
+          <tr><td colspan="6" style="text-align:center; color: var(--text-muted);">加载中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Inbound Audit Tab -->
+    <div id="tab-inbound" class="card tab-content" style="display:none;">
+      <h2>Inbound 访问审计 (谁向我的现场发起了 Query)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>提问人</th>
+            <th>提问内容</th>
+            <th>探针回答</th>
+            <th>状态</th>
+            <th>调用工具</th>
+            <th>耗时</th>
+          </tr>
+        </thead>
+        <tbody id="inbound-table-body">
+          <tr><td colspan="7" style="text-align:center; color: var(--text-muted);">暂无记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Outbound Audit Tab -->
+    <div id="tab-outbound" class="card tab-content" style="display:none;">
+      <h2>Outbound 提问历史 (我发起的 Query)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>被问成员</th>
+            <th>问题</th>
+            <th>回答内容</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="outbound-table-body">
+          <tr><td colspan="5" style="text-align:center; color: var(--text-muted);">暂无记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Feishu Tab -->
+    <div id="tab-feishu" class="card tab-content" style="display:none;">
+      <h2>个人专属飞书 Bot 凭据绑定</h2>
+      <div class="subtitle" style="margin-bottom: 20px;">配置您在飞书开放平台创建的自建应用，其他人可通过飞书向您的专属 Bot 提问。</div>
+      <div class="form-group">
+        <label>App ID</label>
+        <input type="text" id="fs-app-id" placeholder="cli_xxxxxxxxxxxxx">
+      </div>
+      <div class="form-group">
+        <label>App Secret</label>
+        <input type="password" id="fs-app-secret" placeholder="••••••••••••••••">
+      </div>
+      <div class="form-group">
+        <label>Verification Token</label>
+        <input type="text" id="fs-token" placeholder="v_xxxxxxxxxxxx">
+      </div>
+      <div class="form-group">
+        <label>Encrypt Key</label>
+        <input type="password" id="fs-encrypt-key" placeholder="••••••••••••••••">
+      </div>
+      <button class="btn-primary" onclick="saveFeishuBinding()">保存飞书配置</button>
+      <div id="feishu-result" style="margin-top: 12px; font-size: 14px;"></div>
+    </div>
+
+    <!-- Admin Tab -->
+    <div id="tab-admin" class="card tab-content" style="display:none;">
+      <h2>生成成员配对邀请码</h2>
+      <div class="form-group">
+        <label>管理员 Token (Admin Token)</label>
+        <input type="password" id="admin-token" placeholder="ti_adm_...">
+      </div>
+      <div class="form-group">
+        <label>成员姓名</label>
+        <input type="text" id="inv-name" placeholder="例如: 张三">
+      </div>
+      <div class="form-group">
+        <label>别名 (逗号分隔)</label>
+        <input type="text" id="inv-aliases" placeholder="例如: zhangsan, 三哥">
+      </div>
+      <button class="btn-primary" onclick="generateInvite()">生成邀请码</button>
+      <div id="invite-result" style="margin-top: 16px; font-weight: 600; color: var(--success);"></div>
+    </div>
+  </div>
+
+  <script>
+    function getToken() {
+      // 1. Check URL hash fragment (#token=...)
+      const hash = window.location.hash;
+      if (hash && hash.includes('token=')) {
+        const match = hash.match(/token=([^&]+)/);
+        if (match && match[1]) {
+          const t = match[1];
+          sessionStorage.setItem('talkintent_token', t);
+          history.replaceState(null, "", window.location.pathname);
+          return t;
+        }
+      }
+      return sessionStorage.getItem('talkintent_token') || "";
+    }
+
+    function authHeaders() {
+      const token = getToken();
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers['Authorization'] = 'Bearer ' + token;
+      }
+      return headers;
+    }
+
+    function showTab(name) {
+      document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+      document.querySelectorAll('.nav button').forEach(el => el.classList.remove('active'));
+      const target = document.getElementById('tab-' + name);
+      if (target) target.style.display = 'block';
+      if (event && event.target) event.target.classList.add('active');
+
+      if (name === 'members') loadMembers();
+      if (name === 'inbound') loadInboundAudit();
+      if (name === 'outbound') loadOutboundAudit();
+      if (name === 'feishu') loadFeishuBinding();
+    }
+
+    async function checkAuth() {
+      const token = getToken();
+      if (!token) return;
+      try {
+        const res = await fetch('/api/v1/members/me', { headers: authHeaders() });
+        if (res.ok) {
+          const me = await res.json();
+          document.getElementById('user-badge').className = 'badge badge-online';
+          document.getElementById('user-badge').innerText = me.name + ' (' + me.id + ')';
+        }
+      } catch (err) {}
+    }
+
+    async function loadMembers() {
+      try {
+        const res = await fetch('/api/v1/members', { headers: authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        const tbody = document.getElementById('members-table-body');
+        if (!data.members || data.members.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">暂无注册成员</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.members.map(m => `
+          <tr>
+            <td><strong>${escapeHtml(m.name)}</strong></td>
+            <td>${escapeHtml((m.aliases || []).join(', ') || '-')}</td>
+            <td><span class="badge ${m.online ? 'badge-online' : 'badge-offline'}">${m.online ? '在线' : '离线'}</span></td>
+            <td>${escapeHtml(m.machine_name || '-')}</td>
+            <td>${escapeHtml((m.workspaces || []).join(', ') || '-')}</td>
+            <td>${m.has_feishu_bot ? '已绑定' : '未绑定'}</td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function loadInboundAudit() {
+      try {
+        const res = await fetch('/api/v1/audit/inbound', { headers: authHeaders() });
+        const tbody = document.getElementById('inbound-table-body');
+        if (!res.ok) {
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color: var(--danger);">需要登录后查看</td></tr>';
+          return;
+        }
+        const data = await res.json();
+        if (!data.entries || data.entries.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">暂无 Inbound 审计记录</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.entries.map((e, idx) => `
+          <tr>
+            <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
+            <td>${escapeHtml(e.asker_name)}</td>
+            <td>${escapeHtml(e.query)}</td>
+            <td>
+              <button class="btn-sm" onclick="toggleAnswer('ans-${idx}')">查看回答</button>
+              <div id="ans-${idx}" class="answer-box" style="display:none;">${escapeHtml(e.answer || '(暂无回答或执行中)')}</div>
+            </td>
+            <td><span class="badge ${e.status === 'completed' ? 'badge-online' : 'badge-offline'}">${e.status}</span></td>
+            <td>${escapeHtml((e.tools_used || []).join(', ') || '-')}</td>
+            <td>${e.duration_ms}ms</td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function loadOutboundAudit() {
+      try {
+        const res = await fetch('/api/v1/audit/outbound', { headers: authHeaders() });
+        const tbody = document.getElementById('outbound-table-body');
+        if (!res.ok) {
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--danger);">需要登录后查看</td></tr>';
+          return;
+        }
+        const data = await res.json();
+        if (!data.entries || data.entries.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">暂无 Outbound 审计记录</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.entries.map((e, idx) => `
+          <tr>
+            <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
+            <td>${escapeHtml(e.target_member_name)}</td>
+            <td>${escapeHtml(e.query)}</td>
+            <td>
+              <button class="btn-sm" onclick="toggleAnswer('out-ans-${idx}')">查看回答</button>
+              <div id="out-ans-${idx}" class="answer-box" style="display:none;">${escapeHtml(e.answer || '(暂无回答或执行中)')}</div>
+            </td>
+            <td><span class="badge ${e.status === 'completed' ? 'badge-online' : 'badge-offline'}">${e.status}</span></td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function loadFeishuBinding() {
+      try {
+        const res = await fetch('/api/v1/feishu/binding', { headers: authHeaders() });
+        if (res.ok) {
+          const b = await res.json();
+          document.getElementById('fs-app-id').value = b.app_id || '';
+          document.getElementById('fs-token').value = b.verification_token || '';
+        }
+      } catch (err) {}
+    }
+
+    async function saveFeishuBinding() {
+      const payload = {
+        app_id: document.getElementById('fs-app-id').value.trim(),
+        app_secret: document.getElementById('fs-app-secret').value.trim(),
+        verification_token: document.getElementById('fs-token').value.trim(),
+        encrypt_key: document.getElementById('fs-encrypt-key').value.trim(),
+      };
+      const resultEl = document.getElementById('feishu-result');
+      try {
+        const res = await fetch('/api/v1/feishu/binding', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          resultEl.style.color = 'var(--success)';
+          resultEl.innerText = '飞书配置已安全保存 (AES-GCM 加密存储)。';
+        } else {
+          resultEl.style.color = 'var(--danger)';
+          resultEl.innerText = '保存失败: HTTP ' + res.status;
+        }
+      } catch (err) {
+        resultEl.style.color = 'var(--danger)';
+        resultEl.innerText = '请求异常: ' + err.message;
+      }
+    }
+
+    async function generateInvite() {
+      const adminToken = document.getElementById('admin-token').value.trim();
+      const name = document.getElementById('inv-name').value.trim();
+      const aliasesRaw = document.getElementById('inv-aliases').value.trim();
+      const aliases = aliasesRaw ? aliasesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+      const resultEl = document.getElementById('invite-result');
+      if (!name) {
+        resultEl.style.color = 'var(--danger)';
+        resultEl.innerText = '请填写成员姓名';
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/v1/admin/invites', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + (adminToken || getToken()),
+          },
+          body: JSON.stringify({
+            target_name: name,
+            aliases: aliases,
+            expires_in_hours: 48,
+          }),
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          resultEl.style.color = 'var(--success)';
+          resultEl.innerHTML = `配对邀请码生成成功: <span style="user-select:all; background:#334155; padding:4px 8px; border-radius:4px;">${data.code}</span> (有效期 48 小时)`;
+        } else {
+          resultEl.style.color = 'var(--danger)';
+          resultEl.innerText = '生成失败: HTTP ' + res.status + ' (请确认管理员 Token 正确)';
+        }
+      } catch (err) {
+        resultEl.style.color = 'var(--danger)';
+        resultEl.innerText = '请求异常: ' + err.message;
+      }
+    }
+
+    function toggleAnswer(id) {
+      const el = document.getElementById(id);
+      if (el) {
+        el.style.display = el.style.display === 'none' ? 'block' : 'none';
+      }
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    window.onload = function() {
+      checkAuth();
+      loadMembers();
+    };
+  </script>
+</body>
+</html>

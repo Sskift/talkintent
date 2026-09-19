@@ -1443,3 +1443,96 @@ func TestDaemonWriteEnvelopeBounded(t *testing.T) {
 	_ = d.Stop()
 	<-startDone
 }
+
+func TestDaemonCleanupFilesIdempotency(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	agent := &mockAgent{}
+	d, tempDir := setupTestDaemon(t, hub, agent)
+
+	statusPath := filepath.Join(tempDir, "daemon-status.json")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = d.Start(ctx)
+	}()
+
+	_, err := hub.WaitForHello(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hello not received: %v", err)
+	}
+
+	// First Stop shuts down cleanly and marks status file as disconnected
+	if err := d.Stop(); err != nil {
+		t.Fatalf("First Stop failed: %v", err)
+	}
+
+	statusAfter, err := ReadDaemonStatus(statusPath)
+	if err != nil {
+		t.Fatalf("Failed to read status file after stop: %v", err)
+	}
+	if statusAfter.Connected {
+		t.Errorf("Expected connected=false after first stop")
+	}
+
+	// Remove status file; subsequent cleanupFiles() or Stop() must be a no-op and not recreate it
+	if err := os.Remove(statusPath); err != nil {
+		t.Fatalf("Failed to remove status file: %v", err)
+	}
+
+	// Direct second cleanupFiles() call must be a no-op
+	d.cleanupFiles()
+	if _, err := os.Stat(statusPath); !os.IsNotExist(err) {
+		t.Errorf("Status file was recreated by direct cleanupFiles call, err: %v", err)
+	}
+
+	// Second Stop() call must also be a no-op
+	if err := d.Stop(); err != nil {
+		t.Errorf("Second Stop failed: %v", err)
+	}
+	if _, err := os.Stat(statusPath); !os.IsNotExist(err) {
+		t.Errorf("Status file was recreated by second Stop call, err: %v", err)
+	}
+}
+
+func TestDaemonStartAfterStop(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	agent := &mockAgent{}
+	d, tempDir := setupTestDaemon(t, hub, agent)
+
+	statusPath := filepath.Join(tempDir, "daemon-status.json")
+	pidPath := filepath.Join(tempDir, "daemon.pid")
+
+	// Call Stop first before Start has ever begun
+	if err := d.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	// Start must return nil promptly without creating any files
+	ctx := context.Background()
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- d.Start(ctx)
+	}()
+
+	select {
+	case err := <-startErrCh:
+		if err != nil {
+			t.Errorf("Expected Start() to return nil after Stop, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Start() did not return promptly after Stop()")
+	}
+
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Errorf("Expected pid file not to exist after Start-after-Stop, err: %v", err)
+	}
+	if _, err := os.Stat(statusPath); !os.IsNotExist(err) {
+		t.Errorf("Expected status file not to exist after Start-after-Stop, err: %v", err)
+	}
+}

@@ -157,6 +157,12 @@ func NewServer(cfg *config.HubConfig, st store.Store, webFS fs.FS, logger *slog.
 	return h, nil
 }
 
+// shutdownTimeout bounds the shutdown duration in Start. If in-flight handlers
+// or connections do not drain within this window, the server forcefully closes all listeners
+// and connections via httpServer.Close. 10s gives long-running requests ample time to wrap up
+// cleanly while ensuring process exit (e.g. on SIGINT/SIGTERM) does not hang indefinitely.
+const shutdownTimeout = 10 * time.Second
+
 // Addr returns the network address the server is listening on. Callers poll this from
 // another goroutine while Start is binding (e.g. tests using ":0"), so the listener
 // field is read under the lock.
@@ -245,13 +251,21 @@ func (h *HubServer) Start(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		return h.Stop(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := h.Stop(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			_ = h.httpServer.Close()
+			return err
+		}
+		return nil
 	case err := <-errCh:
 		return err
 	}
 }
 
-// Stop gracefully shuts down the server.
+// Stop gracefully shuts down the server, honoring the caller-provided ctx deadline.
+// If the context expires or shutdown errors, httpServer.Close is called to terminate
+// any remaining connections.
 func (h *HubServer) Stop(ctx context.Context) error {
 	h.logger.Info("Shutting down Hub server")
 	select {
@@ -271,7 +285,11 @@ func (h *HubServer) Stop(ctx context.Context) error {
 	h.daemonConns = make(map[string]*daemonSession)
 	h.mu.Unlock()
 
-	return h.httpServer.Shutdown(ctx)
+	if err := h.httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		_ = h.httpServer.Close()
+		return err
+	}
+	return nil
 }
 
 func (h *HubServer) registerRoutes(mux *http.ServeMux) {
@@ -1165,6 +1183,9 @@ func (h *HubServer) handleQuerySubmit(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(waitTimeout):
 			// Timeout reached while waiting
 			h.removeWaiter(queryID, waitCh)
+		case <-h.stopCh:
+			// Server is shutting down; drain in-flight waiter with current status immediately
+			h.removeWaiter(queryID, waitCh)
 		case <-r.Context().Done():
 			remaining := h.removeWaiter(queryID, waitCh)
 			if remaining == 0 {
@@ -1260,6 +1281,12 @@ func (h *HubServer) handleQueryDetail(w http.ResponseWriter, r *http.Request) {
 					q = latest
 				}
 			case <-time.After(waitDur):
+				h.removeWaiter(queryID, waitCh)
+				if latest, err := h.store.GetQuery(r.Context(), queryID); err == nil {
+					q = latest
+				}
+			case <-h.stopCh:
+				// Server is shutting down; drain in-flight waiter with latest status immediately
 				h.removeWaiter(queryID, waitCh)
 				if latest, err := h.store.GetQuery(r.Context(), queryID); err == nil {
 					q = latest

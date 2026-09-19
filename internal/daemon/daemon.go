@@ -107,6 +107,7 @@ func NewClientDaemon(cfg *config.ClientConfig, agent probe.Agent, logger *slog.L
 		activeQueries:     make(map[string]context.CancelFunc),
 		statusFilePath:    StatusFilePath(homeDir),
 		pidFilePath:       PIDFilePath(homeDir),
+		cleanedUp:         true,
 		initialBackoff:    1 * time.Second,
 		maxBackoff:        30 * time.Second,
 		pongTimeout:       10 * time.Second,
@@ -205,6 +206,16 @@ func (d *ClientDaemon) SetFilePaths(statusPath, pidPath string) {
 
 // Start begins the persistent connection loop, reconnecting with exponential backoff and jitter.
 func (d *ClientDaemon) Start(ctx context.Context) error {
+	// Return immediately without creating files if shutdown was already requested.
+	select {
+	case <-d.stopCh:
+		return nil
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	d.wg.Add(1)
 	defer d.wg.Done()
 
@@ -872,10 +883,15 @@ func (d *ClientDaemon) writeStatusFile(connected bool) {
 	}
 }
 
+// cleanupFiles marks the daemon as disconnected in the status file and removes the PID file.
+// It is idempotent: subsequent calls are no-ops to avoid resurrecting cleaned-up state.
 func (d *ClientDaemon) cleanupFiles() {
 	d.statusMu.Lock()
 	defer d.statusMu.Unlock()
 
+	if d.cleanedUp {
+		return
+	}
 	d.cleanedUp = true
 	if d.statusFilePath != "" {
 		status := DaemonStatus{

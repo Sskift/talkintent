@@ -1474,3 +1474,384 @@ func TestRESTErrorResponsesJSON(t *testing.T) {
 		checkErrorResponse(rec, http.StatusBadRequest, protocol.ErrCodeInvalidArgument)
 	}
 }
+
+// TestShutdownUnblocksLongPolling verifies that when Hub is stopped via context cancellation
+// or Stop(), in-flight long-polling requests (GET ?wait= and POST ?wait=) return immediately
+// with well-formed responses and Start exits within 2 seconds.
+func TestShutdownUnblocksLongPolling(t *testing.T) {
+	t.Run("GET_detail_wait", func(t *testing.T) {
+		tempDir := t.TempDir()
+		st, err := store.NewJSONLStore(tempDir)
+		if err != nil {
+			t.Fatalf("failed to create test store: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+
+		cfg := &config.HubConfig{
+			Addr:    "127.0.0.1:0",
+			DataDir: tempDir,
+			RateLimits: config.RateLimitConfig{
+				QueriesPerMinute: 60,
+				Burst:            30,
+			},
+		}
+
+		srv, err := NewServer(cfg, st, nil, nil)
+		if err != nil {
+			t.Fatalf("failed to create server: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		startDone := make(chan error, 1)
+		go func() {
+			startDone <- srv.Start(ctx)
+		}()
+
+		var hubAddr string
+		for i := 0; i < 50; i++ {
+			addr := srv.Addr()
+			if addr != "" && !strings.HasSuffix(addr, ":0") {
+				hubAddr = addr
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if hubAddr == "" {
+			t.Fatalf("hub server failed to bind")
+		}
+
+		invAsker, err := st.CreateInvite(context.Background(), &protocol.InviteCreateRequest{TargetName: "AskerA"})
+		if err != nil {
+			t.Fatalf("create asker invite failed: %v", err)
+		}
+		pairAsker, err := st.ConsumeInvite(context.Background(), &protocol.PairRequest{InviteCode: invAsker.Code, MachineName: "dev-asker-a"})
+		if err != nil {
+			t.Fatalf("consume asker invite failed: %v", err)
+		}
+
+		invTarget, err := st.CreateInvite(context.Background(), &protocol.InviteCreateRequest{TargetName: "TargetA"})
+		if err != nil {
+			t.Fatalf("create target invite failed: %v", err)
+		}
+		_, err = st.ConsumeInvite(context.Background(), &protocol.PairRequest{InviteCode: invTarget.Code, MachineName: "dev-target-a"})
+		if err != nil {
+			t.Fatalf("consume target invite failed: %v", err)
+		}
+
+		// Submit query to offline target -> queued
+		submitPayload := protocol.QuerySubmitRequest{
+			Target: "TargetA",
+			Query:  "What are you working on?",
+		}
+		b, _ := json.Marshal(submitPayload)
+		reqSubmit, err := http.NewRequest("POST", "http://"+hubAddr+"/api/v1/queries", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("create submit request failed: %v", err)
+		}
+		reqSubmit.Header.Set("Authorization", "Bearer "+pairAsker.Token)
+		reqSubmit.Header.Set("Content-Type", "application/json")
+
+		respSubmit, err := http.DefaultClient.Do(reqSubmit)
+		if err != nil {
+			t.Fatalf("submit query failed: %v", err)
+		}
+		defer respSubmit.Body.Close()
+		if respSubmit.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 202 Accepted, got %d", respSubmit.StatusCode)
+		}
+		var createdQuery protocol.QueryDetailResponse
+		if err := json.NewDecoder(respSubmit.Body).Decode(&createdQuery); err != nil {
+			t.Fatalf("failed to decode created query: %v", err)
+		}
+		if createdQuery.Status != protocol.QueryStatusQueued {
+			t.Fatalf("expected queued status, got %s", createdQuery.Status)
+		}
+
+		// Start long-poll in background
+		type pollResult struct {
+			statusCode int
+			query      protocol.QueryDetailResponse
+			err        error
+		}
+		pollDone := make(chan pollResult, 1)
+		go func() {
+			client := &http.Client{Timeout: 5 * time.Second}
+			reqPoll, err := http.NewRequest("GET", "http://"+hubAddr+"/api/v1/queries/"+createdQuery.QueryID+"?wait=30s", nil)
+			if err != nil {
+				pollDone <- pollResult{err: err}
+				return
+			}
+			reqPoll.Header.Set("Authorization", "Bearer "+pairAsker.Token)
+			resp, err := client.Do(reqPoll)
+			if err != nil {
+				pollDone <- pollResult{err: err}
+				return
+			}
+			defer resp.Body.Close()
+
+			var q protocol.QueryDetailResponse
+			decErr := json.NewDecoder(resp.Body).Decode(&q)
+			pollDone <- pollResult{
+				statusCode: resp.StatusCode,
+				query:      q,
+				err:        decErr,
+			}
+		}()
+
+		// Wait until waiter is registered
+		for i := 0; i < 50; i++ {
+			srv.mu.RLock()
+			count := len(srv.queryWaiters[createdQuery.QueryID])
+			srv.mu.RUnlock()
+			if count > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		srv.mu.RLock()
+		count := len(srv.queryWaiters[createdQuery.QueryID])
+		srv.mu.RUnlock()
+		if count == 0 {
+			t.Fatalf("expected at least 1 registered waiter")
+		}
+
+		// Cancel context to trigger Start's shutdown path
+		cancel()
+
+		// (a) Start must return within 2s
+		select {
+		case err := <-startDone:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("Start returned unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Start did not return within 2s")
+		}
+
+		// (b) long-poll got well-formed response with current status
+		select {
+		case res := <-pollDone:
+			if res.err != nil {
+				t.Fatalf("long-poll request failed: %v", res.err)
+			}
+			if res.statusCode != http.StatusOK {
+				t.Fatalf("expected 200 OK from detail long-poll, got %d", res.statusCode)
+			}
+			if res.query.QueryID != createdQuery.QueryID {
+				t.Errorf("expected query ID %s, got %s", createdQuery.QueryID, res.query.QueryID)
+			}
+			if res.query.Status != protocol.QueryStatusQueued {
+				t.Errorf("expected status queued, got %s", res.query.Status)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("long-poll did not return within 2s")
+		}
+
+		srv.mu.RLock()
+		remaining := len(srv.queryWaiters[createdQuery.QueryID])
+		srv.mu.RUnlock()
+		if remaining != 0 {
+			t.Errorf("expected 0 remaining waiters, got %d", remaining)
+		}
+	})
+
+	t.Run("POST_submit_wait", func(t *testing.T) {
+		tempDir := t.TempDir()
+		st, err := store.NewJSONLStore(tempDir)
+		if err != nil {
+			t.Fatalf("failed to create test store: %v", err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+
+		cfg := &config.HubConfig{
+			Addr:    "127.0.0.1:0",
+			DataDir: tempDir,
+			RateLimits: config.RateLimitConfig{
+				QueriesPerMinute: 60,
+				Burst:            30,
+			},
+		}
+
+		srv, err := NewServer(cfg, st, nil, nil)
+		if err != nil {
+			t.Fatalf("failed to create server: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		startDone := make(chan error, 1)
+		go func() {
+			startDone <- srv.Start(ctx)
+		}()
+
+		var hubAddr string
+		for i := 0; i < 50; i++ {
+			addr := srv.Addr()
+			if addr != "" && !strings.HasSuffix(addr, ":0") {
+				hubAddr = addr
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if hubAddr == "" {
+			t.Fatalf("hub server failed to bind")
+		}
+
+		invAsker, _ := st.CreateInvite(context.Background(), &protocol.InviteCreateRequest{TargetName: "AskerB"})
+		pairAsker, _ := st.ConsumeInvite(context.Background(), &protocol.PairRequest{InviteCode: invAsker.Code, MachineName: "dev-asker-b"})
+
+		invTarget, _ := st.CreateInvite(context.Background(), &protocol.InviteCreateRequest{TargetName: "TargetB"})
+		_, _ = st.ConsumeInvite(context.Background(), &protocol.PairRequest{InviteCode: invTarget.Code, MachineName: "dev-target-b"})
+
+		type submitResult struct {
+			statusCode int
+			query      protocol.QueryDetailResponse
+			err        error
+		}
+		submitDone := make(chan submitResult, 1)
+
+		go func() {
+			client := &http.Client{Timeout: 5 * time.Second}
+			submitPayload := protocol.QuerySubmitRequest{
+				Target: "TargetB",
+				Query:  "What are you working on?",
+				Wait:   true,
+			}
+			b, _ := json.Marshal(submitPayload)
+			reqSubmit, err := http.NewRequest("POST", "http://"+hubAddr+"/api/v1/queries?wait=30s", bytes.NewReader(b))
+			if err != nil {
+				submitDone <- submitResult{err: err}
+				return
+			}
+			reqSubmit.Header.Set("Authorization", "Bearer "+pairAsker.Token)
+			reqSubmit.Header.Set("Content-Type", "application/json")
+
+			resp, err := client.Do(reqSubmit)
+			if err != nil {
+				submitDone <- submitResult{err: err}
+				return
+			}
+			defer resp.Body.Close()
+
+			var q protocol.QueryDetailResponse
+			decErr := json.NewDecoder(resp.Body).Decode(&q)
+			submitDone <- submitResult{
+				statusCode: resp.StatusCode,
+				query:      q,
+				err:        decErr,
+			}
+		}()
+
+		// Wait until waiter is registered
+		var queryID string
+		for i := 0; i < 50; i++ {
+			srv.mu.RLock()
+			for qid, waiters := range srv.queryWaiters {
+				if len(waiters) > 0 {
+					queryID = qid
+					break
+				}
+			}
+			srv.mu.RUnlock()
+			if queryID != "" {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if queryID == "" {
+			t.Fatalf("expected registered waiter for submit request")
+		}
+
+		// Cancel context to trigger Start's shutdown path
+		cancel()
+
+		// (a) Start must return within 2s
+		select {
+		case err := <-startDone:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("Start returned unexpected error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Start did not return within 2s")
+		}
+
+		// (b) submit got well-formed response with current status (202 Accepted)
+		select {
+		case res := <-submitDone:
+			if res.err != nil {
+				t.Fatalf("submit request failed: %v", res.err)
+			}
+			if res.statusCode != http.StatusAccepted {
+				t.Fatalf("expected 202 Accepted from submit long-poll, got %d", res.statusCode)
+			}
+			if res.query.QueryID != queryID {
+				t.Errorf("expected query ID %s, got %s", queryID, res.query.QueryID)
+			}
+			if res.query.Status != protocol.QueryStatusQueued {
+				t.Errorf("expected status queued, got %s", res.query.Status)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("submit long-poll did not return within 2s")
+		}
+
+		srv.mu.RLock()
+		remaining := len(srv.queryWaiters[queryID])
+		srv.mu.RUnlock()
+		if remaining != 0 {
+			t.Errorf("expected 0 remaining waiters, got %d", remaining)
+		}
+	})
+}
+
+// TestStopMethodHonorsCallerCtx verifies that Stop(ctx) respects the caller's context
+// and closes connections cleanly.
+func TestStopMethodHonorsCallerCtx(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := store.NewJSONLStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.HubConfig{
+		Addr:    "127.0.0.1:0",
+		DataDir: tempDir,
+	}
+	srv, err := NewServer(cfg, st, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	startDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		startDone <- srv.Start(ctx)
+	}()
+
+	for i := 0; i < 50; i++ {
+		addr := srv.Addr()
+		if addr != "" && !strings.HasSuffix(addr, ":0") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	if err := srv.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+
+	select {
+	case err := <-startDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Start returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Start did not exit after Stop")
+	}
+}

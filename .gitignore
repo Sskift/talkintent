@@ -1,0 +1,13 @@
+# binaries
+/bin/
+/dist/
+*.exe
+# local state
+/.talkintent/
+/data/
+*.local.json
+.env
+*.env
+# test artifacts
+/coverage*
+/.render-check.json

@@ -28,6 +28,10 @@ import (
 // ClientVersion is the wire protocol version advertised in daemon_hello.
 const ClientVersion = "1.0.0"
 
+// envelopeWriteTimeout bounds a single frame write to the Hub; a peer that cannot
+// drain a small JSON frame in this long is dead and the heartbeat deadline will reap it.
+const envelopeWriteTimeout = 5 * time.Second
+
 // Runner manages the client daemon lifecycle and connection loop.
 type Runner interface {
 	Start(ctx context.Context) error
@@ -61,11 +65,16 @@ type ClientDaemon struct {
 	statusFilePath string
 	pidFilePath    string
 	statusMu       sync.Mutex
+	cleanedUp      bool
 
 	// Transport configuration knobs
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 	pongTimeout    time.Duration
+
+	// Drain grace window & state
+	drainGraceTimeout time.Duration
+	draining          bool
 }
 
 // NewClientDaemon constructs a new ClientDaemon runner.
@@ -90,18 +99,91 @@ func NewClientDaemon(cfg *config.ClientConfig, agent probe.Agent, logger *slog.L
 
 	homeDir := config.GetTalkIntentHome()
 	return &ClientDaemon{
-		cfg:            cfg,
-		agent:          agent,
-		logger:         logger,
-		stopCh:         make(chan struct{}),
-		sem:            make(chan struct{}, maxConc),
-		activeQueries:  make(map[string]context.CancelFunc),
-		statusFilePath: StatusFilePath(homeDir),
-		pidFilePath:    PIDFilePath(homeDir),
-		initialBackoff: 1 * time.Second,
-		maxBackoff:     30 * time.Second,
-		pongTimeout:    10 * time.Second,
+		cfg:               cfg,
+		agent:             agent,
+		logger:            logger,
+		stopCh:            make(chan struct{}),
+		sem:               make(chan struct{}, maxConc),
+		activeQueries:     make(map[string]context.CancelFunc),
+		statusFilePath:    StatusFilePath(homeDir),
+		pidFilePath:       PIDFilePath(homeDir),
+		initialBackoff:    1 * time.Second,
+		maxBackoff:        30 * time.Second,
+		pongTimeout:       10 * time.Second,
+		drainGraceTimeout: 15 * time.Second,
 	}, nil
+}
+
+// SetDrainGrace overrides the shutdown drain grace window (default 15s).
+func (d *ClientDaemon) SetDrainGrace(grace time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.drainGraceTimeout = grace
+}
+
+func (d *ClientDaemon) getDrainGrace() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.drainGraceTimeout <= 0 {
+		return 15 * time.Second
+	}
+	return d.drainGraceTimeout
+}
+
+func (d *ClientDaemon) setDraining(val bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.draining = val
+}
+
+func (d *ClientDaemon) isDraining() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.draining
+}
+
+func (d *ClientDaemon) isConnected() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.activeConn != nil
+}
+
+func (d *ClientDaemon) tryAcquireProbe() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	select {
+	case <-d.stopCh:
+		return false
+	default:
+	}
+	if d.draining {
+		return false
+	}
+	d.inFlightWg.Add(1)
+	return true
+}
+
+func (d *ClientDaemon) waitForInFlightProbes(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		d.inFlightWg.Wait()
+		close(done)
+	}()
+	if timeout <= 0 {
+		<-done
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		d.logger.Warn("Timed out waiting for in-flight probes to unwind")
+	}
+}
+
+func (d *ClientDaemon) requestShutdown() {
+	d.stopOnce.Do(func() {
+		close(d.stopCh)
+	})
 }
 
 // SetBackoffParams overrides backoff parameters (useful for fast-paced unit tests).
@@ -130,6 +212,19 @@ func (d *ClientDaemon) Start(ctx context.Context) error {
 
 	d.initFiles()
 	defer d.cleanupFiles()
+	defer d.waitForInFlightProbes(3 * time.Second)
+
+	// Watch for context cancellation to trigger graceful shutdown
+	stopWatcher := make(chan struct{})
+	defer close(stopWatcher)
+	go func() {
+		select {
+		case <-ctx.Done():
+			d.requestShutdown()
+		case <-d.stopCh:
+		case <-stopWatcher:
+		}
+	}()
 
 	initialBackoff := d.initialBackoff
 	if initialBackoff <= 0 {
@@ -143,10 +238,13 @@ func (d *ClientDaemon) Start(ctx context.Context) error {
 
 	for {
 		select {
+		case <-d.stopCh:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-d.stopCh:
-			return nil
 		default:
 		}
 
@@ -155,6 +253,9 @@ func (d *ClientDaemon) Start(ctx context.Context) error {
 
 		select {
 		case <-d.stopCh:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -173,10 +274,13 @@ func (d *ClientDaemon) Start(ctx context.Context) error {
 		}
 
 		select {
+		case <-d.stopCh:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-d.stopCh:
-			return nil
 		default:
 		}
 
@@ -188,10 +292,13 @@ func (d *ClientDaemon) Start(ctx context.Context) error {
 		}
 
 		select {
+		case <-d.stopCh:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-d.stopCh:
-			return nil
 		case <-time.After(sleepDuration):
 			backoff *= 2
 			if backoff > maxBackoff {
@@ -203,32 +310,9 @@ func (d *ClientDaemon) Start(ctx context.Context) error {
 
 // Stop cleanly shuts down the daemon, draining in-flight probes before closing.
 func (d *ClientDaemon) Stop() error {
-	d.stopOnce.Do(func() {
-		close(d.stopCh)
-	})
-
-	// 1. Drain in-flight probes with a 15-second grace window
-	drainDone := make(chan struct{})
-	go func() {
-		d.inFlightWg.Wait()
-		close(drainDone)
-	}()
-
-	select {
-	case <-drainDone:
-		d.logger.Info("All in-flight probes drained successfully")
-	case <-time.After(15 * time.Second):
-		d.logger.Warn("Timed out waiting for in-flight probes to drain during shutdown")
-	}
-
-	// 2. Close active WebSocket connection
-	d.mu.Lock()
-	if d.activeConn != nil {
-		_ = d.activeConn.Close(websocket.StatusNormalClosure, "daemon stopping")
-	}
-	d.mu.Unlock()
-
+	d.requestShutdown()
 	d.wg.Wait()
+	d.waitForInFlightProbes(3 * time.Second)
 	d.cleanupFiles()
 	return nil
 }
@@ -258,7 +342,21 @@ func (d *ClientDaemon) connectAndServe(ctx context.Context) error {
 		HTTPHeader: headers,
 	}
 
-	conn, _, err := websocket.Dial(ctx, wsURL, opts)
+	dialCtx, cancelDial := context.WithCancel(ctx)
+	defer cancelDial()
+
+	dialWatcher := make(chan struct{})
+	defer close(dialWatcher)
+	go func() {
+		select {
+		case <-d.stopCh:
+			cancelDial()
+		case <-dialCtx.Done():
+		case <-dialWatcher:
+		}
+	}()
+
+	conn, _, err := websocket.Dial(dialCtx, wsURL, opts)
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
@@ -278,6 +376,14 @@ func (d *ClientDaemon) connectAndServe(ctx context.Context) error {
 		}
 		d.mu.Unlock()
 	}()
+
+	// Check if stop was requested while dialing
+	select {
+	case <-d.stopCh:
+		_ = conn.Close(websocket.StatusNormalClosure, "daemon stopping")
+		return nil
+	default:
+	}
 
 	// 1. Send daemon_hello with computed privacy prompt metadata
 	workspaces := make([]protocol.WorkspaceInfo, 0, len(d.cfg.Workspaces))
@@ -314,6 +420,7 @@ func (d *ClientDaemon) connectAndServe(ctx context.Context) error {
 
 	d.logger.Info("Connected to Hub successfully", "ws_url", wsURL)
 	d.writeStatusFile(true)
+	d.setDraining(false)
 
 	// Heartbeat setup and dynamic interval adjustment
 	intervalSec := d.cfg.HeartbeatIntervalSec
@@ -341,8 +448,11 @@ func (d *ClientDaemon) connectAndServe(ctx context.Context) error {
 		pingSentAt   time.Time
 	)
 
-	connCtx, cancelConn := context.WithCancel(ctx)
-	defer cancelConn()
+	connCtx, cancelConn := context.WithCancel(context.Background())
+	defer func() {
+		cancelConn()
+		d.waitForInFlightProbes(3 * time.Second)
+	}()
 
 	msgCh := make(chan protocol.Envelope, 32)
 	errCh := make(chan error, 1)
@@ -371,12 +481,51 @@ func (d *ClientDaemon) connectAndServe(ctx context.Context) error {
 		}
 	}()
 
+	// Shutdown is a state, not an exit: on stopCh we stop taking work, keep the socket
+	// and connCtx alive so in-flight probes can still answer, and leave only when they
+	// have all finished or the grace window runs out. stopCh is nilled after the first
+	// hit so the closed channel does not spin the select.
+	var (
+		stopCh       = d.stopCh
+		drainDone    chan struct{}
+		drainTimer   *time.Timer
+		drainTimerCh <-chan time.Time
+	)
+	defer func() {
+		if drainTimer != nil {
+			drainTimer.Stop()
+		}
+	}()
+
 	for {
+		if drainTimer != nil {
+			drainTimerCh = drainTimer.C
+		}
+
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-d.stopCh:
+		case <-stopCh:
+			stopCh = nil
+			d.setDraining(true)
+
+			drainDone = make(chan struct{})
+			go func() {
+				d.inFlightWg.Wait()
+				close(drainDone)
+			}()
+
+			drainGrace := d.getDrainGrace()
+			drainTimer = time.NewTimer(drainGrace)
+
+		case <-drainDone:
+			d.logger.Info("All in-flight probes drained successfully")
+			_ = conn.Close(websocket.StatusNormalClosure, "daemon stopping")
 			return nil
+
+		case <-drainTimerCh:
+			d.logger.Warn("Timed out waiting for in-flight probes to drain during shutdown")
+			_ = conn.Close(websocket.StatusNormalClosure, "daemon stopping")
+			return nil
+
 		case err := <-errCh:
 			return fmt.Errorf("read failed: %w", err)
 
@@ -445,6 +594,12 @@ func (d *ClientDaemon) connectAndServe(ctx context.Context) error {
 					d.logger.Warn("Failed to unmarshal query_request payload", "err", err)
 					continue
 				}
+				// Once shutdown has begun we take no new work; the hub requeues dispatched
+				// queries when this socket closes, so declining silently is safe.
+				if !d.tryAcquireProbe() {
+					d.logger.Info("Declining new query during shutdown", "query_id", req.QueryID)
+					continue
+				}
 				go d.handleQueryRequest(connCtx, conn, req)
 			}
 		}
@@ -471,13 +626,15 @@ func (d *ClientDaemon) writeEnvelope(ctx context.Context, conn *websocket.Conn, 
 		return fmt.Errorf("failed to marshal envelope: %w", err)
 	}
 
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), envelopeWriteTimeout)
+	defer cancel()
+
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
-	return conn.Write(ctx, websocket.MessageText, b)
+	return conn.Write(writeCtx, websocket.MessageText, b)
 }
 
 func (d *ClientDaemon) handleQueryRequest(connCtx context.Context, conn *websocket.Conn, req protocol.QueryRequestPayload) {
-	d.inFlightWg.Add(1)
 	defer d.inFlightWg.Done()
 
 	timeoutSec := req.TimeoutSeconds
@@ -521,19 +678,17 @@ func (d *ClientDaemon) handleQueryRequest(connCtx context.Context, conn *websock
 	}
 
 	atomic.AddInt32(&d.activeProbeCount, 1)
-	d.writeStatusFile(true)
+	d.writeStatusFile(d.isConnected() && !d.isDraining())
 	defer func() {
 		atomic.AddInt32(&d.activeProbeCount, -1)
-		d.writeStatusFile(true)
+		d.writeStatusFile(d.isConnected() && !d.isDraining())
 	}()
 
 	d.dispatchQuery(queryCtx, conn, req)
 }
 
 func (d *ClientDaemon) sendQueryResponse(conn *websocket.Conn, res *protocol.QueryResponsePayload) error {
-	writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return d.writeEnvelope(writeCtx, conn, protocol.TypeQueryResponse, res)
+	return d.writeEnvelope(context.Background(), conn, protocol.TypeQueryResponse, res)
 }
 
 func (d *ClientDaemon) dispatchQuery(ctx context.Context, conn *websocket.Conn, req protocol.QueryRequestPayload) {
@@ -677,6 +832,7 @@ func (d *ClientDaemon) initFiles() {
 	d.statusMu.Lock()
 	defer d.statusMu.Unlock()
 
+	d.cleanedUp = false
 	pid := os.Getpid()
 	if d.pidFilePath != "" {
 		_ = writePIDFile(d.pidFilePath, pid)
@@ -698,7 +854,7 @@ func (d *ClientDaemon) writeStatusFile(connected bool) {
 	d.statusMu.Lock()
 	defer d.statusMu.Unlock()
 
-	if d.statusFilePath == "" {
+	if d.cleanedUp || d.statusFilePath == "" {
 		return
 	}
 
@@ -720,6 +876,7 @@ func (d *ClientDaemon) cleanupFiles() {
 	d.statusMu.Lock()
 	defer d.statusMu.Unlock()
 
+	d.cleanedUp = true
 	if d.statusFilePath != "" {
 		status := DaemonStatus{
 			PID:          os.Getpid(),

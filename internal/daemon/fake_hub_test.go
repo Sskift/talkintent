@@ -30,6 +30,9 @@ type FakeHub struct {
 	autoPong     bool
 	ackInterval  int
 	sessionID    string
+	closeStatus  websocket.StatusCode
+	closeErr     error
+	closedCh     chan struct{}
 }
 
 // NewFakeHub starts an httptest HTTP and WebSocket server.
@@ -41,6 +44,8 @@ func NewFakeHub(t *testing.T) *FakeHub {
 		autoPong:    true,
 		ackInterval: 20,
 		sessionID:   "sess_fake_001",
+		closeStatus: -1,
+		closedCh:    make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -223,6 +228,24 @@ func (h *FakeHub) WaitForResponse(timeout time.Duration) (*protocol.QueryRespons
 	}
 }
 
+// WaitForClose blocks until the active connection is closed by the peer or timeout.
+func (h *FakeHub) WaitForClose(timeout time.Duration) (websocket.StatusCode, error) {
+	h.mu.Lock()
+	ch := h.closedCh
+	h.mu.Unlock()
+	if ch == nil {
+		return -1, errors.New("no connection has been established yet")
+	}
+	select {
+	case <-ch:
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.closeStatus, nil
+	case <-time.After(timeout):
+		return -1, errors.New("timeout waiting for connection close")
+	}
+}
+
 func (h *FakeHub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.headers = r.Header.Clone()
@@ -238,8 +261,12 @@ func (h *FakeHub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	conn.SetReadLimit(2 * 1024 * 1024)
 
+	closedCh := make(chan struct{})
 	h.mu.Lock()
 	h.activeConn = conn
+	h.closeStatus = -1
+	h.closeErr = nil
+	h.closedCh = closedCh
 	h.mu.Unlock()
 
 	defer func() {
@@ -254,6 +281,11 @@ func (h *FakeHub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
+			h.mu.Lock()
+			h.closeErr = err
+			h.closeStatus = websocket.CloseStatus(err)
+			close(closedCh)
+			h.mu.Unlock()
 			return
 		}
 

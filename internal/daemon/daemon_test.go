@@ -936,3 +936,510 @@ func TestDaemonQueryTimeoutTransmission(t *testing.T) {
 		t.Errorf("Expected status %q, got %q", protocol.QueryStatusTimeout, resp.Status)
 	}
 }
+
+func TestDaemonGracefulDrainOnStop(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	probeStarted := make(chan struct{})
+	probeRelease := make(chan struct{})
+
+	agent := &mockAgent{
+		runFunc: func(ctx context.Context, req *probe.RunRequest) (*protocol.QueryResponsePayload, error) {
+			close(probeStarted)
+			select {
+			case <-probeRelease:
+				return &protocol.QueryResponsePayload{
+					QueryID: req.QueryID,
+					Status:  protocol.QueryStatusCompleted,
+					Answer:  "Gracefully finished",
+				}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+
+	d, _ := setupTestDaemon(t, hub, agent)
+	d.SetDrainGrace(2 * time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- d.Start(ctx)
+	}()
+
+	_, err := hub.WaitForHello(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hello not received: %v", err)
+	}
+
+	// Dispatch query
+	err = hub.SendQuery(protocol.QueryRequestPayload{
+		QueryID:         "qry_drain_stop",
+		Query:           "Drain test query",
+		TargetWorkspace: "ws_1",
+		TimeoutSeconds:  10,
+	})
+	if err != nil {
+		t.Fatalf("SendQuery failed: %v", err)
+	}
+
+	// Wait for probe to start running
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Timed out waiting for probe to start")
+	}
+
+	// Call Stop in a goroutine while probe is in flight
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- d.Stop()
+	}()
+
+	// Ensure Stop does not immediately close connection or kill probe
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop() returned prematurely while probe in flight: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Release probe
+	close(probeRelease)
+
+	// Hub must receive the query_response
+	resp, err := hub.WaitForResponse(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hub failed to receive query_response during drain: %v", err)
+	}
+	if resp.QueryID != "qry_drain_stop" || resp.Answer != "Gracefully finished" {
+		t.Errorf("Unexpected response: %+v", resp)
+	}
+
+	// Hub connection should close with StatusNormalClosure
+	code, err := hub.WaitForClose(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Connection not closed after drain: %v", err)
+	}
+	if code != websocket.StatusNormalClosure {
+		t.Errorf("Expected StatusNormalClosure (1000), got %v", code)
+	}
+
+	// Stop() should return nil promptly
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Errorf("Stop() failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timed out waiting for Stop() to return")
+	}
+
+	select {
+	case <-startErrCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Start() did not exit")
+	}
+}
+
+func TestDaemonDrainGraceTimeoutOnStop(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	probeStarted := make(chan struct{})
+	probeExited := make(chan struct{})
+	agent := &mockAgent{
+		runFunc: func(ctx context.Context, req *probe.RunRequest) (*protocol.QueryResponsePayload, error) {
+			close(probeStarted)
+			<-ctx.Done() // Never finishes on its own until connCtx is cancelled
+			close(probeExited)
+			return nil, ctx.Err()
+		},
+	}
+
+	d, _ := setupTestDaemon(t, hub, agent)
+	d.SetDrainGrace(150 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- d.Start(ctx)
+	}()
+
+	_, err := hub.WaitForHello(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hello not received: %v", err)
+	}
+
+	err = hub.SendQuery(protocol.QueryRequestPayload{
+		QueryID:         "qry_hang",
+		Query:           "Hanging query",
+		TargetWorkspace: "ws_1",
+		TimeoutSeconds:  30,
+	})
+	if err != nil {
+		t.Fatalf("SendQuery failed: %v", err)
+	}
+
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Probe did not start")
+	}
+
+	start := time.Now()
+	err = d.Stop()
+	duration := time.Since(start)
+
+	if err != nil {
+		t.Errorf("Stop() returned error: %v", err)
+	}
+	if duration > 2*time.Second {
+		t.Errorf("Stop() took %v, expected < 2s with 150ms drain grace", duration)
+	}
+	if duration < 100*time.Millisecond {
+		t.Errorf("Stop() returned too quickly (%v), expected >= 100ms", duration)
+	}
+
+	// Wait for Start and probe to cleanly finish unwinding before tempDir cleanup
+	select {
+	case <-probeExited:
+	case <-time.After(2 * time.Second):
+	}
+	select {
+	case <-startErrCh:
+	case <-time.After(2 * time.Second):
+	}
+}
+
+func TestDaemonGracefulDrainOnContextCancel(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	probeStarted := make(chan struct{})
+	probeRelease := make(chan struct{})
+
+	agent := &mockAgent{
+		runFunc: func(ctx context.Context, req *probe.RunRequest) (*protocol.QueryResponsePayload, error) {
+			close(probeStarted)
+			select {
+			case <-probeRelease:
+				return &protocol.QueryResponsePayload{
+					QueryID: req.QueryID,
+					Status:  protocol.QueryStatusCompleted,
+					Answer:  "Context cancel drain finished",
+				}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+
+	d, _ := setupTestDaemon(t, hub, agent)
+	d.SetDrainGrace(2 * time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- d.Start(ctx)
+	}()
+
+	_, err := hub.WaitForHello(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hello not received: %v", err)
+	}
+
+	err = hub.SendQuery(protocol.QueryRequestPayload{
+		QueryID:         "qry_ctx_cancel",
+		Query:           "Cancel test query",
+		TargetWorkspace: "ws_1",
+		TimeoutSeconds:  10,
+	})
+	if err != nil {
+		t.Fatalf("SendQuery failed: %v", err)
+	}
+
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Timed out waiting for probe to start")
+	}
+
+	// Cancel the context passed to Start (simulating SIGINT)
+	cancel()
+
+	// Ensure probe is not aborted immediately
+	select {
+	case <-startErrCh:
+		t.Fatalf("Start() returned prematurely before probe finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Release probe
+	close(probeRelease)
+
+	// Hub should receive query_response
+	resp, err := hub.WaitForResponse(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hub failed to receive query_response: %v", err)
+	}
+	if resp.QueryID != "qry_ctx_cancel" || resp.Answer != "Context cancel drain finished" {
+		t.Errorf("Unexpected response: %+v", resp)
+	}
+
+	// Connection closed normally
+	code, err := hub.WaitForClose(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Connection not closed: %v", err)
+	}
+	if code != websocket.StatusNormalClosure {
+		t.Errorf("Expected StatusNormalClosure, got %v", code)
+	}
+
+	// Start() exits cleanly with context.Canceled
+	select {
+	case err := <-startErrCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Start() did not exit")
+	}
+}
+
+func TestDaemonDrainingServicesPongsAndCancelsAndRejectsNewQueries(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	probe1Started := make(chan struct{})
+	probe1Canceled := make(chan struct{})
+	probe2Started := make(chan struct{})
+
+	agent := &mockAgent{
+		runFunc: func(ctx context.Context, req *probe.RunRequest) (*protocol.QueryResponsePayload, error) {
+			if req.QueryID == "qry_cancel_drain" {
+				close(probe1Started)
+				<-ctx.Done()
+				close(probe1Canceled)
+				return nil, ctx.Err()
+			}
+			if req.QueryID == "qry_rejected" {
+				close(probe2Started)
+				return &protocol.QueryResponsePayload{
+					QueryID: req.QueryID,
+					Status:  protocol.QueryStatusCompleted,
+				}, nil
+			}
+			return &protocol.QueryResponsePayload{
+				QueryID: req.QueryID,
+				Status:  protocol.QueryStatusCompleted,
+			}, nil
+		},
+	}
+
+	d, _ := setupTestDaemon(t, hub, agent)
+	d.SetDrainGrace(3 * time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startDone := make(chan struct{})
+	go func() {
+		_ = d.Start(ctx)
+		close(startDone)
+	}()
+
+	_, err := hub.WaitForHello(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hello not received: %v", err)
+	}
+
+	// Start query 1
+	err = hub.SendQuery(protocol.QueryRequestPayload{
+		QueryID:         "qry_cancel_drain",
+		Query:           "To be cancelled during drain",
+		TargetWorkspace: "ws_1",
+		TimeoutSeconds:  30,
+	})
+	if err != nil {
+		t.Fatalf("SendQuery failed: %v", err)
+	}
+
+	select {
+	case <-probe1Started:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Probe 1 did not start")
+	}
+
+	// Trigger shutdown
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- d.Stop()
+	}()
+
+	// Wait until daemon entered draining state
+	drainDeadline := time.Now().Add(3 * time.Second)
+	for !d.isDraining() && time.Now().Before(drainDeadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !d.isDraining() {
+		t.Fatalf("Daemon failed to enter draining state")
+	}
+
+	// Send a heartbeat pong from hub to ensure pong handling works without panicking
+	_ = hub.SendEnvelope(protocol.TypeHeartbeatPong, protocol.HeartbeatPongPayload{ServerTime: time.Now().UnixMilli()})
+
+	// Send query 2 which arrives AFTER shutdown began - must be rejected/ignored
+	err = hub.SendQuery(protocol.QueryRequestPayload{
+		QueryID:         "qry_rejected",
+		Query:           "Should not be executed",
+		TargetWorkspace: "ws_1",
+		TimeoutSeconds:  5,
+	})
+	if err != nil {
+		t.Fatalf("SendQuery 2 failed: %v", err)
+	}
+
+	// Verify query 2 is NOT started
+	select {
+	case <-probe2Started:
+		t.Fatalf("Query arriving during drain was erroneously executed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Cancel query 1 during drain: cancel frame must be processed!
+	err = hub.SendCancel("qry_cancel_drain", "cancel during drain")
+	if err != nil {
+		t.Fatalf("SendCancel failed: %v", err)
+	}
+
+	// Probe 1 must be cancelled promptly
+	select {
+	case <-probe1Canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Probe 1 was not cancelled by query_cancel during drain")
+	}
+
+	// Wait for Stop() to complete cleanly
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Errorf("Stop() failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Stop() timed out")
+	}
+	<-startDone
+}
+
+func TestDaemonConnectionLossCancelsInFlightProbe(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	probeStarted := make(chan struct{})
+	probeCanceled := make(chan struct{})
+
+	agent := &mockAgent{
+		runFunc: func(ctx context.Context, req *probe.RunRequest) (*protocol.QueryResponsePayload, error) {
+			close(probeStarted)
+			<-ctx.Done()
+			close(probeCanceled)
+			return nil, ctx.Err()
+		},
+	}
+
+	d, _ := setupTestDaemon(t, hub, agent)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startDone := make(chan struct{})
+	go func() {
+		_ = d.Start(ctx)
+		close(startDone)
+	}()
+
+	_, err := hub.WaitForHello(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hello not received: %v", err)
+	}
+
+	err = hub.SendQuery(protocol.QueryRequestPayload{
+		QueryID:         "qry_conn_loss",
+		Query:           "Should abort on conn drop",
+		TargetWorkspace: "ws_1",
+		TimeoutSeconds:  30,
+	})
+	if err != nil {
+		t.Fatalf("SendQuery failed: %v", err)
+	}
+
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Probe did not start")
+	}
+
+	// Drop connection abruptly
+	hub.CloseActiveConn(websocket.StatusAbnormalClosure, "network failure")
+
+	select {
+	case <-probeCanceled:
+		// Success: probe aborted on connection loss
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Probe context was not cancelled upon connection loss")
+	}
+
+	cancel()
+	_ = d.Stop()
+	<-startDone
+}
+
+func TestDaemonWriteEnvelopeBounded(t *testing.T) {
+	hub := NewFakeHub(t)
+	defer hub.Close()
+
+	agent := &mockAgent{}
+	d, _ := setupTestDaemon(t, hub, agent)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startDone := make(chan struct{})
+	go func() {
+		_ = d.Start(ctx)
+		close(startDone)
+	}()
+
+	_, err := hub.WaitForHello(3 * time.Second)
+	if err != nil {
+		t.Fatalf("Hello not received: %v", err)
+	}
+
+	d.mu.Lock()
+	conn := d.activeConn
+	d.mu.Unlock()
+
+	if conn == nil {
+		t.Fatalf("activeConn is nil")
+	}
+
+	// Verify writeEnvelope with a cancelled parent context still succeeds due to context.WithoutCancel
+	canceledCtx, cancelImmediate := context.WithCancel(context.Background())
+	cancelImmediate()
+
+	ping := protocol.HeartbeatPingPayload{ActiveProbeCount: 0}
+	err = d.writeEnvelope(canceledCtx, conn, protocol.TypeHeartbeatPing, ping)
+	if err != nil {
+		t.Fatalf("writeEnvelope failed with cancelled caller context: %v", err)
+	}
+
+	_ = d.Stop()
+	<-startDone
+}

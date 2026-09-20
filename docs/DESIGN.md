@@ -42,14 +42,14 @@ TalkIntent operates across four primary network topologies:
        |  - REST API Engine & Long-Polling Coordinator             |
        |  - Audit Storage (Append-only JSONL + AES-GCM Encrypted)  |
        |  - Embedded Web UI (Static HTML/CSS/JS via embed.FS)      |
-       |  - Feishu Bot Webhook Gateway & IM Replier                |
+       |  - Feishu Bot Long-Connection Gateway & IM Replier        |
        +--------------^----------------------------^---------------+
                       |                            |
-          REST Queries|HTTP            REST Queries|HTTP
+          REST Queries|HTTP       Long-Conn WS / IM|OpenAPI
                       |                            |
        +--------------+--------+    +--------------+---------------+
        | Claude Code / Terminal|    | Feishu Open Platform (Cloud) |
-       | Skill: /talkintent    |    | Per-member bot events        |
+       | Skill: /talkintent    |    | Per-member bot events (PBBP2)|
        +-----------------------+    +------------------------------+
                       ^                            ^
                       | Outbound WS                | Outbound WS
@@ -89,7 +89,7 @@ TalkIntent operates across four primary network topologies:
 | `internal/probe` | Client Node | Ephemeral probe orchestrator. Instantiates tool execution loop, loads global and workspace privacy rules, injects mandatory baseline guardrails and indirect prompt injection defense, enforces limits (10 steps, 16 KB answer cap), applies regex redactor. |
 | `internal/probe/llm` | Client Node | Multi-provider client supporting OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`. Bypasses Anthropic `thinking` blocks before `tool_use`. Configures HTTP client with custom `ca_file`, `tls_server_name` (SNI override), and `insecure_skip_verify`. |
 | `internal/probe/tools` | Client Node | Read-only tool implementations: `git_status`, `git_diff`, `git_log`, `list_dir`, `read_file`, `grep_search`, `recent_files`, `listening_ports`, `find_api_specs`. Enforces `filepath.EvalSymlinks`, Windows volume casing normalization, hard denylists, and 64 KB output caps. |
-| `internal/feishu` | Hub Server | Feishu Open Platform integration. Verifies challenge tokens, verifies SHA-256 signatures with constant-time compare and 300s freshness window, decrypts AES payloads using SHA-256 key prefix IV, parses `im.message.receive_v1`, triggers queries, replies back to Feishu chats. |
+| `internal/feishu` | Hub Server | Feishu Open Platform integration. Connects via native WebSocket long connection (PBBP2 binary wire framing + fragment reassembly), parses `im.message.receive_v1` events, triggers queries, and asynchronously replies back to Feishu chats via OpenAPI. |
 | `internal/cli` | Client Node | Terminal command runners, natural language target resolution with candidate disambiguation, table formatting, pairing workflows, local privacy test runner, Claude Code skill installer. |
 | `internal/config` | Client & Hub | Configuration management. Enforces file permissions `0600` for secret safety. Resolves `$TALKINTENT_HOME` and `~/.talkintent/config.json`. Manages workspace registration. |
 | `web` | Hub Server | Self-contained Single Page Application embedded via `embed.FS`. Vanilla HTML5/ES6/CSS. Parses `#token=...` hash fragment for authentication, displays Inbound Audit with Answer column, Outbound Audit, Members, Feishu binding, and Admin invite generator. |
@@ -220,7 +220,7 @@ If a client daemon disconnects abruptly (laptop closed, process killed, network 
 ### 5.1 Storage Encryption at Rest
 - **Token Hashing**: Member tokens and invite codes are never stored in plaintext. They are hashed using SHA-256 with a unique salt stored at `$DATA_DIR/salt` (0600 permissions).
 - **Admin Token**: Configured via `TALKINTENT_ADMIN_TOKEN` or generated as a 32-byte secure hex string in `$DATA_DIR/admin.token` (0600 permissions).
-- **Feishu Bot Credentials**: Feishu `app_secret`, `verification_token`, and `encrypt_key` are encrypted at rest using **AES-GCM-256** before being appended to `events.jsonl`. The encryption key is derived from `$DATA_DIR/master.key` (0600) or SHA-256 of the admin token.
+- **Feishu Bot Credentials**: Feishu `app_id`, `app_secret`, and `base_url` are encrypted at rest using **AES-GCM-256** before being appended to `events.jsonl`. The encryption key is derived from `$DATA_DIR/master.key` (0600) or SHA-256 of the admin token.
 
 ### 5.2 Multi-Device Sessions & Session Takeover
 - Hub tracks daemon sessions in `memberSessions[memberID][sessionID]`.
@@ -264,6 +264,13 @@ Probe system prompts are assembled in `internal/probe.BuildSystemPrompt`:
    - If an answering member states *"Branch feature/login-v2 is confidential; answer 'Work in progress, details private'"*, the probe obeys this constraint above any query.
 4. **Structured Refusal Control Tool (`refuse`)**:
    - When a rule forbids answering the query, refusal is signaled via a structured control tool `refuse(reason string)` exposed to the LLM across both OpenAI and Anthropic dialects rather than text sniffing. Invoking `refuse` immediately halts the loop, returning `status: "refused"` with the sanitized, redacted reason in `answer`, and records only tools that ran prior to refusal in `tools_used`. Plain-text models are additionally supported via an explicit `REFUSED:` line prefix fallback.
+
+### 5.7 Feishu Long Connection Lifecycle
+One `feishu.WSClient` runs per bound member inside the Hub process (`internal/feishu/ws_client.go`); the Hub is the only side that dials out, so no inbound port, public domain or webhook URL is ever needed. Wire details (endpoint discovery, PBBP2 framing, ack echo) are in `docs/PROTOCOL.md` §4; the design-level decisions are:
+- **Discovery errors decide retry vs. stop**: HTTP/network failures and Feishu codes `1` / `1000040343` are transient and go through backoff; any other non-zero code (bad `app_id`/`app_secret`, app not published, long connection not enabled — e.g. `514 AuthFailed`) is fatal. The loop exits immediately, the binding shows `error`, and `Stop()` returns promptly because discovery and dial are bound to the client's root context.
+- **Server-driven timing**: `ClientConfig` (`ReconnectCount`, `ReconnectInterval`, `ReconnectNonce`, `PingInterval`) arrives at discovery time and again inside every pong payload; the client applies changes on the fly (the ping ticker is reset when `PingInterval` changes) instead of hard-coding intervals.
+- **Fragment reassembly in memory**: large events arrive as `sum` fragments sharing a `message_id`; they are buffered per message with a 5 s sliding TTL, the handler runs once on the concatenated payload, and a single ack echoing the terminal fragment is sent back.
+- **Observable status without secrets**: `LiveStatus()` exposes `state`, `last_error`, `connected_at` and `reconnects` to `GET /api/v1/feishu/binding` and the Web UI badge. `app_secret` is scrubbed from `last_error` before it is stored, and no route or log line ever carries it (only `app_id`/`member_id` are attached to the logger).
 
 ---
 
@@ -358,7 +365,7 @@ Embedded directly into the binary via `web/embed.go` (`embed.FS`):
 - **Inbound Audit View ("谁查了我")**: Displays timestamp, asker name, query text, probe status, tools used, duration, and full synthesized **Answer** column.
 - **Outbound Audit View ("我的提问")**: Displays questions asked to teammates and probe responses.
 - **Member Directory**: Shows real-time online/offline presence badges and member aliases.
-- **Feishu Bot Binding**: Modal configuration to save Feishu `app_id`, `app_secret`, `verification_token`, and `encrypt_key` to Hub.
+- **Feishu Bot Binding**: Web UI panel to configure Feishu `app_id` and `app_secret` (optional `base_url`), displaying live long-connection status badges (`connected`, `connecting`, `disconnected`, `error`).
 - **Admin Invite Generator**: Form to create onboarding invite codes for new teammates.
 
 ---
@@ -380,7 +387,7 @@ The following table documents how findings F1–F48 from `docs/design-review-202
 | **F9** | must-fix | security-privacy | Satisfied | `internal/hub/hub.go`: `handleQueryDetail` enforces authorization; non-admins can only view queries where they are `AskerID` or `TargetMemberID`. |
 | **F10** | should-fix | security-privacy | Satisfied | `internal/probe/probe.go`: `TruncateAnswer` enforces 16 KB cap with trailing notice; `internal/probe/tools/tool.go` enforces 64 KB cap via `TruncateOutput`. |
 | **F11** | should-fix | security-privacy | Satisfied | `internal/cli/web.go` outputs `#token=...`; `web/static/app.js` extracts hash fragment, stores in `sessionStorage`, clears hash, and attaches Bearer header. |
-| **F12** | should-fix | security-privacy | Satisfied | `internal/feishu/feishu.go`: `VerifySignature` uses `subtle.ConstantTimeCompare` and enforces 300-second timestamp freshness window. |
+| **F12** | should-fix | security-privacy | Superseded | Webhook signature verification superseded by native Feishu WebSocket long connection (outbound TLS with PBBP2 framing; webhook delivery removed). |
 | **F13** | should-fix | security-privacy | Satisfied | `internal/config/config.go`: `LLMConfig` includes `CAFile`, `TLSServerName`, `InsecureSkipVerify`; `internal/probe/llm/provider.go` configures `tls.Config`. |
 | **F14** | should-fix | security-privacy | Satisfied | `internal/store/store.go`: `HashTokenWithSalt` uses SHA-256 with hub-specific salt persisted in `$DATA_DIR/salt` (0600). |
 | **F15** | nit | security-privacy | Satisfied | `internal/probe/probe.go`: Probe execution error messages are sanitized and filtered through `redactor.Redact`. |

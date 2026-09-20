@@ -53,6 +53,7 @@ type Store interface {
 	SaveFeishuBinding(ctx context.Context, memberID string, req *protocol.FeishuBindingRequest) error
 	GetFeishuBinding(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error)
 	DeleteFeishuBinding(ctx context.Context, memberID string) error
+	ListFeishuBindings(ctx context.Context) (map[string]*protocol.FeishuBindingRequest, error)
 
 	// Queries & Audit
 	CreateQuery(ctx context.Context, q *protocol.QueryDetailResponse) error
@@ -1084,6 +1085,18 @@ func (s *jsonlStore) GetFeishuBinding(ctx context.Context, memberID string) (*pr
 	}
 	cp := *b
 	return &cp, nil
+}
+
+// ListFeishuBindings returns all currently configured Feishu bot credentials mapped by memberID.
+func (s *jsonlStore) ListFeishuBindings(ctx context.Context) (map[string]*protocol.FeishuBindingRequest, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[string]*protocol.FeishuBindingRequest, len(s.feishuBindings))
+	for mid, b := range s.feishuBindings {
+		cp := *b
+		res[mid] = &cp
+	}
+	return res, nil
 }
 
 // DeleteFeishuBinding clears a member's Feishu bot credentials.

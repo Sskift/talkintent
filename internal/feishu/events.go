@@ -9,7 +9,7 @@ import (
 
 var userMentionRegex = regexp.MustCompile(`@_user_\d+`)
 
-// EventEnvelope is the top-level Feishu webhook payload.
+// EventEnvelope is the top-level Feishu event payload.
 type EventEnvelope struct {
 	Schema    string       `json:"schema,omitempty"`
 	Header    *EventHeader `json:"header,omitempty"`

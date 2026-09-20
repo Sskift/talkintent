@@ -469,7 +469,7 @@ Shows queries initiated by the authenticated member.
 
 ---
 
-### 3.5 Feishu Bot Binding & Webhook
+### 3.5 Feishu Bot Binding & Long Connection
 
 #### 3.5.1 Get Current Feishu Binding
 - **Route**: `GET /api/v1/feishu/binding`
@@ -479,9 +479,17 @@ Shows queries initiated by the authenticated member.
 {
   "bound": true,
   "app_id": "cli_aa17a38637f8dbb7",
-  "webhook_url": "http://hub.talkintent.internal:8080/api/v1/feishu/webhook/mem_01J8ZHANGSAN"
+  "status": "connected",
+  "connected_at": "2026-09-20T13:05:42+08:00",
+  "reconnects": 0
 }
 ```
+- `status`: `connecting` | `connected` | `disconnected` | `error` | `stopped`. `disconnected` is also reported when the Hub holds a binding but no client is running for it.
+- `error` (omitted when empty): the most recent connection error, e.g. `feishu client error (code 10003): invalid app_secret` or `reconnect limit reached`. `app_secret` is redacted before the message is stored, so it can never appear here.
+- `connected_at` (RFC3339, omitted when not connected): when the current WebSocket session was established.
+- `reconnects`: cumulative count of successful re-connections since the client started (`0` for the first connection).
+
+`app_secret` is never returned by any route.
 
 #### 3.5.2 Set Feishu Binding Credentials
 - **Route**: `POST /api/v1/feishu/binding`
@@ -491,11 +499,18 @@ Shows queries initiated by the authenticated member.
 {
   "app_id": "cli_aa17a38637f8dbb7",
   "app_secret": "sec_xxxxxxxxxxxxxxxxxxxxxx",
-  "verification_token": "ver_yyyyyyyyyyyyyyyyyy",
-  "encrypt_key": "enc_zzzzzzzzzzzzzzzzzz"
+  "base_url": "https://open.feishu.cn"
 }
 ```
-*Credentials are stored encrypted at rest using AES-GCM-256.*
+*`app_secret` is stored encrypted at rest using AES-GCM-256. `base_url` is optional and defaults to `https://open.feishu.cn`.*
+- **Response 200 OK**:
+```json
+{
+  "bound": true,
+  "app_id": "cli_aa17a38637f8dbb7",
+  "status": "connecting"
+}
+```
 
 #### 3.5.3 Delete Feishu Binding
 - **Route**: `DELETE /api/v1/feishu/binding`
@@ -504,69 +519,112 @@ Shows queries initiated by the authenticated member.
 
 ---
 
-## 4. Feishu Webhook Contract
+## 4. Feishu Long Connection WebSocket Specification
 
-### 4.1 URL Verification Challenge
-When configuring event subscription in Feishu Developer Console:
+TalkIntent interacts with Feishu Open Platform exclusively through native Long Connection (WebSocket) mode using the PBBP2 (Protocol Buffers 2) framing protocol. No public IP, domain, reverse proxy, or webhook endpoint is required.
+
+### 4.1 Endpoint Discovery
+Before dialing the WebSocket stream, the client obtains a dynamic endpoint and runtime connection parameters:
+- **Route**: `POST /callback/ws/endpoint`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `locale: zh`
+- **Request Body** (credentials travel only in the body, mirroring the official SDK):
 ```json
 {
-  "challenge": "ajls384kjsdf85423",
-  "token": "ver_yyyyyyyyyyyyyyyyyy",
-  "type": "url_verification"
+  "AppID": "cli_aa17a38637f8dbb7",
+  "AppSecret": "sec_xxxxxxxxxxxxxxxxxxxxxx"
 }
 ```
-If encrypted, Hub decrypts using AES-CBC-256 where IV is the first 16 bytes of `SHA256(encrypt_key)` (`keyHash[:16]`).  
-Hub returns:
+- **Response 200 OK**:
 ```json
 {
-  "challenge": "ajls384kjsdf85423"
-}
-```
-
-### 4.2 Signature Verification
-Hub verifies the `X-Lark-Signature` header using constant-time comparison and enforces a 300s timestamp freshness window:
-```
-signature = SHA256(timestamp + nonce + encrypt_key + raw_body)
-```
-
-### 4.3 Event Dispatch: `im.message.receive_v1`
-1. Hub receives the event payload:
-```json
-{
-  "schema": "2.0",
-  "header": {
-    "event_id": "evt_01J8EVT001",
-    "event_type": "im.message.receive_v1",
-    "create_time": "1726828800000"
-  },
-  "event": {
-    "sender": {
-      "sender_id": {
-        "open_id": "ou_62c7d721..."
-      },
-      "sender_type": "user"
-    },
-    "message": {
-      "message_id": "om_01J8MSG001",
-      "chat_id": "oc_65f32e69...",
-      "chat_type": "p2p",
-      "message_type": "text",
-      "content": "{\"text\":\"现在登录模块进展如何？\"}"
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "url": "wss://<feishu-gateway-host>/callback/ws/connect?service_id=...",
+    "ClientConfig": {
+      "ReconnectCount": -1,
+      "ReconnectInterval": 120,
+      "ReconnectNonce": 30,
+      "PingInterval": 120
     }
   }
 }
 ```
-2. Hub acknowledges Feishu immediately with HTTP 200 `{}`.
-3. Hub saves `FeishuContext{MessageID: "om_01J8MSG001", ChatID: "oc_65f32e69...", AppID: "..."}` and dispatches the query to the member's daemon.
-4. When the daemon answers, Hub fetches a `tenant_access_token` and calls Feishu IM reply API:
+*Error Handling*:
+- HTTP non-200, network errors and timeouts: retryable (`ServerError`), scheduled for reconnection with backoff.
+- Body `code == 1` (system busy) or `code == 1000040343`: retryable (`ServerError`).
+- Any other non-zero `code` (e.g. invalid `app_id`/`app_secret`): fatal (`ClientError`) — the client stops and the binding status becomes `error` with the Feishu message attached.
+- `code == 0` with an empty `url`: treated as retryable.
+
+### 4.2 Wire Framing (PBBP2)
+All frames over the WebSocket stream are encoded in Protocol Buffers 2 wire format (field tags with standard LEB128 varint and length-delimited byte slices):
+
+| Field Tag | Field Name | Wire Type | Description |
+|---|---|---|---|
+| 1 | `seq_id` | Varint (uint64) | Monotonically increasing sequence identifier |
+| 2 | `log_id` | Varint (uint64) | Tracing log ID |
+| 3 | `service` | Varint (int32) | Feishu service identifier |
+| 4 | `method` | Varint (int32) | `0` = Control (Ping/Pong), `1` = Data (Event/Response) |
+| 5 | `headers` | Length-delimited | Repeated key-value string pairs (Tag 1 = key, Tag 2 = value) |
+| 6 | `payload_encoding` | Length-delimited | Payload encoding (e.g. `gzip` or empty) |
+| 7 | `payload_type` | Length-delimited | MIME type or format of payload |
+| 8 | `payload` | Length-delimited | Raw bytes of message or event payload |
+| 9 | `log_id_new` | Length-delimited | String representation of log ID for distributed tracing |
+
+### 4.3 Heartbeat (Ping/Pong)
+- **Client Ping**: Every `PingInterval` seconds (configured via `ClientConfig`, default 120s), the client writes a Frame with:
+  - `Method = 0`
+  - Headers: `type: ping`
+- **Server Pong**: Server replies with a Frame with `Method = 0` and headers `type: pong`. The pong frame payload contains an updated `ClientConfig` JSON, which the client parses to update heartbeat and reconnection parameters.
+
+### 4.4 Event Ingestion & Fragment Reassembly
+Feishu pushes events as data frames:
+- `Method = 1`
+- Header `type = event` (any data frame with non-event type is dropped)
+- Frames include partitioning headers: `message_id`, `sum`, and `seq`.
+
+#### Fragment Reassembly Rules:
+1. If `sum <= 1`, the payload is complete and processed immediately.
+2. If `sum > 1024` or `seq < 0` or `seq >= sum`, the frame is dropped to prevent memory exhaustion or out-of-bounds panics.
+3. Multi-part fragments are reassembled in an in-memory buffer indexed by `message_id` with a sliding 5-second TTL.
+4. If a fragment arrives with a different `sum` than previously recorded for that `message_id`, or `seq >= len(parts)`, the fragment is discarded.
+5. Once all `sum` parts are received, they are concatenated and dispatched to the event handler.
+
+### 4.5 Response Acknowledgment & Header Echo
+For every complete `type = event` message received, the client replies with an acknowledgment frame (the same shape the official SDK produces):
+- `Method = 1`
+- Preserves `SeqID`, `LogID`, `LogIDNew`, `Service`, `PayloadEncoding`, and `PayloadType` from the incoming request frame.
+- Echoes **all** request headers (`type`, `message_id`, `sum`, `seq`, `trace_id`, ...) and appends:
+  - `biz_rt`: Processing duration in milliseconds as a string (e.g. `"12"`).
+- Response payload (JSON):
+```json
+{"code":200,"headers":null,"data":null}
+```
+`code` is `200` when the event handler succeeded and `500` when it returned an error. For fragmented messages (`sum > 1`) the handler runs once and **exactly one** acknowledgment is sent — after the fragment that completes reassembly — echoing that fragment's `SeqID`, `LogID` and headers. Fragments that do not complete the message are buffered without a reply, mirroring the official SDK.
+
+### 4.6 Reconnection & Resilience
+1. **Backoff**: the first retry after a failure waits a random `[0, ReconnectNonce)` seconds (jitter, so a fleet of clients does not reconnect in lock-step); every subsequent retry waits `ReconnectInterval` seconds. A successful connection resets the attempt counter. Minimum wait is 100 ms.
+2. **Bounds**: attempts are bounded by `ClientConfig.ReconnectCount` when it is `>= 0`; once reached the client enters the `error` state (`reconnect limit reached`) and stops. `ReconnectCount < 0` (Feishu's default) retries indefinitely.
+3. **Context Lifecycle**: endpoint discovery and the WebSocket dial are bound to the client root context, so `Stop()` aborts an in-flight connect immediately instead of waiting for the 30 s / 20 s timeouts.
+4. **Shared Sockets**: acknowledgment and ping writes use detached 5 s contexts and are serialised under a mutex; a write is skipped if the connection it targets is no longer the active one.
+5. **Pong-driven config**: `ClientConfig` values delivered in pong payloads override the discovery-time values on the fly (`ReconnectCount` may be updated to any non-zero value; intervals only to positive values).
+
+### 4.7 Asynchronous Query Dispatch & IM Reply
+1. Upon reassembly and verification, `im.message.receive_v1` event payloads are passed to `Handler.ProcessEvent`.
+2. Bot/app senders and non-text messages are ignored to prevent infinite message loops.
+3. Messages are deduplicated using `Deduplicator` against both `event_id` and `message_id`.
+4. The query is dispatched to the target member's workspace daemon. If the member is offline, an immediate acknowledgment reply is sent to Feishu informing the user that the query is queued.
+5. When the query completes, the Hub fetches a `tenant_access_token` and calls the Feishu IM reply API:
 ```http
-POST /open-apis/im/v1/messages/om_01J8MSG001/reply HTTP/1.1
+POST /open-apis/im/v1/messages/{message_id}/reply HTTP/1.1
 Host: open.feishu.cn
 Authorization: Bearer t-xxxxxxxxxxxx
 Content-Type: application/json; charset=utf-8
 
 {
-  "content": "{\"text\":\"[TalkIntent 自动回答]\\n张三目前正在 feature/auth-v2 分支...\"}",
+  "content": "{\"text\":\"[TalkIntent 自动回答]\\n张三目前正在 feature/auth-v2 分支重构 JWT 校验器\"}",
   "msg_type": "text"
 }
 ```

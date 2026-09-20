@@ -92,9 +92,8 @@ func TestJSONLStoreLifecycle(t *testing.T) {
 
 	// 6. Test Feishu binding encryption
 	feishuReq := &protocol.FeishuBindingRequest{
-		AppID:      "cli_test_app_id",
-		AppSecret:  "super_secret_feishu_key_12345",
-		EncryptKey: "feishu_encrypt_key_xyz",
+		AppID:     "cli_test_app_id",
+		AppSecret: "super_secret_feishu_key_12345",
 	}
 	if err := st.SaveFeishuBinding(ctx, pairResp.MemberID, feishuReq); err != nil {
 		t.Fatalf("SaveFeishuBinding failed: %v", err)
@@ -228,9 +227,8 @@ func TestReplay1000EventsEquality(t *testing.T) {
 	for i, mid := range memberIDs {
 		_ = st.SetMemberOnline(ctx, mid, i%2 == 0, fmt.Sprintf("machine-%d", i), []string{fmt.Sprintf("ws-%d", i)})
 		_ = st.SaveFeishuBinding(ctx, mid, &protocol.FeishuBindingRequest{
-			AppID:      fmt.Sprintf("app_%d", i),
-			AppSecret:  fmt.Sprintf("secret_%d", i),
-			EncryptKey: fmt.Sprintf("enc_%d", i),
+			AppID:     fmt.Sprintf("app_%d", i),
+			AppSecret: fmt.Sprintf("secret_%d", i),
 		})
 	}
 
@@ -570,10 +568,8 @@ func TestEncryptionRoundTrip(t *testing.T) {
 	pairResp, _ := st.ConsumeInvite(ctx, &protocol.PairRequest{InviteCode: inv.Code, MachineName: "host-d"})
 
 	req := &protocol.FeishuBindingRequest{
-		AppID:             "cli_aa17a38637f8dbb7",
-		AppSecret:         "sec_TOP_SECRET_CREDENTIAL_999",
-		VerificationToken: "ver_TOKEN_12345",
-		EncryptKey:        "enc_KEY_67890",
+		AppID:     "cli_aa17a38637f8dbb7",
+		AppSecret: "sec_TOP_SECRET_CREDENTIAL_999",
 	}
 
 	if err := st.SaveFeishuBinding(ctx, pairResp.MemberID, req); err != nil {
@@ -586,16 +582,13 @@ func TestEncryptionRoundTrip(t *testing.T) {
 	if strings.Contains(raw, "sec_TOP_SECRET_CREDENTIAL_999") {
 		t.Fatal("plaintext AppSecret leaked into events.jsonl")
 	}
-	if strings.Contains(raw, "ver_TOKEN_12345") {
-		t.Fatal("plaintext VerificationToken leaked into events.jsonl")
-	}
 
 	// Read decrypted
 	binding, err := st.GetFeishuBinding(ctx, pairResp.MemberID)
 	if err != nil {
 		t.Fatalf("GetFeishuBinding failed: %v", err)
 	}
-	if binding.AppSecret != req.AppSecret || binding.EncryptKey != req.EncryptKey {
+	if binding.AppSecret != req.AppSecret {
 		t.Errorf("decrypted credentials mismatch: %+v", binding)
 	}
 

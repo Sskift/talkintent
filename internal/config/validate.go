@@ -236,7 +236,7 @@ func (c *HubConfig) Validate() error {
 			errs = append(errs, ValidationError{
 				Field:       "public_url",
 				Message:     fmt.Sprintf("malformed public URL %q", c.PublicURL),
-				Remediation: "specify valid HTTP or HTTPS public URL for webhooks",
+				Remediation: "specify valid HTTP or HTTPS public URL",
 			})
 		}
 	}

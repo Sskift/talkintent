@@ -5,7 +5,7 @@ TalkIntent 是一套面向企业研发团队的分布式工作区感知与异步
 ## 1. 系统架构与安全设计概述
 
 ### 1.1 系统核心组件与拓扑关系
-TalkIntent 系统由两个核心交付单元构成：中心协调服务 Hub 与客户端常驻守护进程 Daemon。Hub 作为集群的调度与分发中枢，负责维护团队成员花名册、路由提问请求、管理离线 FIFO 提问队列、记录追加式（Append-only）审计事件流，并承载内嵌的 Web 监控仪表盘与飞书 Webhook 接收网关。
+TalkIntent 系统由两个核心交付单元构成：中心协调服务 Hub 与客户端常驻守护进程 Daemon。Hub 作为集群的调度与分发中枢，负责维护团队成员花名册、路由提问请求、管理离线 FIFO 提问队列、记录追加式（Append-only）审计事件流，并承载内嵌的 Web 监控仪表盘与飞书长连接（WebSocket）事件网关。
 
 开发者本地节点上常驻运行的 Daemon 负责与 Hub 保持双向通信长连接，持续感知本地注册的代码仓库，并在接收到提问分发请求时拉起本地现场探针（On-Site Probe）。现场探针是一个由本地大模型驱动的 ReAct 智能体（Reasoning + Acting，交替进行推理与工具调用），内置了 `git_status`、`git_diff`、`git_log`、`read_file`、`listening_ports` 等一组受限的本地只读感知工具，以及用于结构化安全拦截的 `refuse` 控制工具。
 
@@ -91,18 +91,28 @@ go build -o bin/talkintent.exe ./cmd/talkintent
 
 ## 3. Hub 协调服务端部署（管理员）
 
-### 3.1 Hub 命令行参数与数据目录结构
+### 3.1 Hub 命令行参数、环境变量与数据目录结构
 Hub 服务通过子命令 `talkintent hub` 启动。启动时 Hub 会使用 `0700` 权限确保存储目录存在，并在其中维护核心数据。
+
+Hub 支持通过命令行标志或环境变量进行全量配置。系统严格遵循三级配置优先级层级：**显式命令行标志（Explicit CLI Flag） > 环境变量（Environment Variable） > 标志默认值（Flag Default）**。当某一配置项同时存在命令行标志与环境变量时，以命令行传入的值为准；若未传入命令行标志，则优先读取对应的环境变量；两者均未指定时，采用内建默认值。
 
 | 命令行标志 | 环境变量覆盖 | 默认值 | 作用说明 |
 | :--- | :--- | :--- | :--- |
-| `-addr` | 无 | `":8080"` | 服务端 HTTP 与 WebSocket 监听地址 |
-| `-data-dir` | 无 | `"./data"` | 核心事件流、审计记录与凭据存储目录 |
-| `-admin-token` | `TALKINTENT_ADMIN_TOKEN` | `""` | 管理员认证令牌，缺省则自动生成落盘 |
-| `-public-url` | 无 | `""` | Hub 对外公网根地址（如 `https://hub.example.com`） |
-| `-json` | 无 | `false` | 以结构化 JSON 格式输出启动元数据 |
+| `-addr` | `TALKINTENT_HUB_ADDR` | `":8080"` | 服务端 HTTP 与 WebSocket 监听地址 |
+| `-data-dir` | `TALKINTENT_DATA_DIR` | `"./data"` | 核心事件流、审计记录与凭据存储目录（或 `$TALKINTENT_HOME/hub`） |
+| `-admin-token` | `TALKINTENT_ADMIN_TOKEN` | `""` | 管理员认证令牌，优先读标志/变量，次选 `admin.token`，无则自动生成 |
+| `-public-url` | `TALKINTENT_PUBLIC_URL` | `""` | Hub 对外公网根地址（用于 WebSocket 跨域白名单与配对声明） |
+| `-heartbeat` | `TALKINTENT_HEARTBEAT_INTERVAL` | `20` | 客户端探针心跳周期（秒，支持带单位如 `"20s"`、`"1m"`） |
+| `-default-query-ttl` | `TALKINTENT_DEFAULT_QUERY_TTL` | `86400` | 离线队列默认存活期（秒，默认 24 小时，支持带单位如 `"24h"`） |
+| `-max-query-ttl` | `TALKINTENT_MAX_QUERY_TTL` | `604800` | 离线队列最大存活上限（秒，默认 7 天，支持带单位如 `"7d"`） |
+| `-max-probe-timeout` | `TALKINTENT_MAX_PROBE_TIMEOUT` | `120` | 单次现场探针执行最长超时限制（秒，支持带单位如 `"2m"`） |
+| `-rate-limit-qpm` | `TALKINTENT_RATE_LIMIT_QPM` | `60` | 每分钟全局允许的最大提问请求频次（Queries Per Minute） |
+| `-rate-limit-burst` | `TALKINTENT_RATE_LIMIT_BURST` | `10` | 提问请求限流令牌桶突发容量上限 |
+| `-json` | 无 | `false` | 以结构化 JSON 格式输出启动元数据（仅支持命令行标志） |
 
-当前版本的 Hub 仅读取 `TALKINTENT_ADMIN_TOKEN` 这一个环境变量；监听地址、数据目录与公网地址必须通过命令行标志传入（下文 systemd / NSSM / Docker Compose 示例均已显式写入标志）。
+对于管理员令牌（Admin Token），系统支持四级解析层级：显式 `-admin-token` 命令行标志 > `TALKINTENT_ADMIN_TOKEN` 环境变量 > `<data-dir>/admin.token` 本地凭据文件 > 首次启动自动生成 32 字节高熵随机令牌（写入 `admin.token` 并施加 `0600` 权限）。服务端启动时终端与日志仅输出令牌 SHA-256 指纹的前 16 位与字符长度，严防生产明文泄露。
+
+对于时间间隔与超时参数（心跳、TTL、探针超时），环境变量与标志均支持直接传入纯正整数秒（例如 `20`、`86400`），或带单位的 Go 标准时长字符串（例如 `20s`、`2m`、`24h`、`7d`），系统将自动解析并做合法性校验。
 
 初始化后，数据目录下会生成以下文件，全部施加 `0600` 文件系统权限：
 1. `admin.token`：存放管理员明文 Token，用于管理员 CLI 鉴权。
@@ -111,10 +121,11 @@ Hub 服务通过子命令 `talkintent hub` 启动。启动时 Hub 会使用 `070
 4. `salt`：由 `crypto/rand` 生成的 32 字节随机盐，用于邀请码的 HMAC-SHA256 哈希存储。
 
 ### 3.2 核心参数 `-public-url` 的配置要求与语义
-在生产部署中，必须显式传递 `-public-url` 参数（例如 `-public-url https://hub.example.com`）。该配置承担三项核心职责：
+在生产部署中，若 Hub 前端挂载了反向代理或域名，建议显式配置 `-public-url` 参数（或通过环境变量 `TALKINTENT_PUBLIC_URL` 设置，例如 `https://hub.example.com`）。该配置承担两项核心职责：
 1. **WebSocket 跨域 Origin 准入白名单**：Daemon 建立 WebSocket 连接时 Hub 会校验 Origin 请求头，设置该参数会自动将对应 Host 纳入准入白名单，防止连接被拒。
-2. **入网配对结果声明**：成员调用配对接口时，Hub 返回给客户端的 `HubURL` 依赖此参数，客户端据此保存到本地 `config.json`。
-3. **飞书回调 Webhook 生成**：配置飞书机器人时，系统生成的 Webhook 地址依赖此公共根路径。
+2. **入网配对结果声明**：成员调用配对接口（`talkintent pair`）时，Hub 返回给客户端的 `HubURL` 依赖此参数，客户端据此持久化到本地 `config.json` 中作为后续建连基准。
+
+**无公网/无 Webhook 依赖说明**：由于 TalkIntent 飞书集成完全采用原生出站长连接（WebSocket）模式，由 Hub 主动与飞书开放平台建立双向通信通道，因此**飞书机器人消息接收完全不需要依赖 `-public-url`，亦不需要公网 IP、域名或任何内网穿透隧道（如 ngrok/frp）**。即使 Hub 仅运行在纯内网或本地开发机上，只要具备访问互联网的出站能力，飞书长连接即可直接建立并正常工作。
 
 ### 3.3 Hub 服务部署与生产持久化运行方案
 根据企业基础设施现状，管理员可从以下四种运行方案中选择其一完成 Hub 部署与启动：
@@ -573,28 +584,53 @@ talkintent skill install
 ## 8. 企业级集成：飞书机器人对接说明
 
 ### 8.1 架构设计与未真机测试诚实声明
-TalkIntent 在 `internal/feishu` 中完整实现了飞书开放平台企业自建应用的对接能力，涵盖 Webhook 回调解包、AES-CBC 解密、SHA-256 签名校验、`url_verification` 挑战握手、`im.message.receive_v1` 事件解析以及基于飞书 OpenAPI 的异步文本消息回复（在原消息下以 `reply` 形式发送纯文本，暂不使用消息卡片）。
+TalkIntent 在 `internal/feishu` 中基于纯标准库和 `github.com/coder/websocket` 实现了原生飞书长连接（WebSocket）网关，完全摒弃了传统的 HTTP Webhook 回调架构。Hub 在启动或成员保存凭据时，主动向飞书开放平台发起出站连接，获取动态 WebSocket 端点并建立基于 PBBP2（Protocol Buffers 2）二进制协议的长连接，直接拉取 `im.message.receive_v1`（接收消息 v2.0）事件帧，处理分片重组（Fragment Reassembly），并在完成探针感知后通过飞书 OpenAPI 异步回复原消息（在原消息下以 `reply` 形式发送纯文本，暂不使用消息卡片）。
+
+**架构优势**：Hub 运行在企业内网或无公网 IP / 域名的私有服务器上即可直接工作，无需公网 IP、无需配置域名与 SSL 证书、无需使用 ngrok/frp/Cloudflare Tunnel 等内网穿透隧道，无需验证 Verification Token 与 Encrypt Key，天然规避了公网暴露面与签名校验复杂性。
 
 **在此如实声明：该飞书集成功能已在代码库中通过了完备的 Mock 单元测试集验证，但尚未在真实的线上商业版飞书企业租户中进行过实机连通性联调**。以下配置指引基于代码现有实现编写，供客户在实际接入飞书时参考。
 
-### 8.2 成员自主绑定飞书机器人操作流程
+### 8.2 飞书开放平台企业自建应用配置步骤与凭据绑定
 
 企业权限注意：在企业飞书租户中，创建自建应用并申请敏感消息收发权限通常受到企业安全合规策略限制，普通研发人员往往无权在飞书开放平台独立发布上线应用。建议由企业 IT 运维或飞书租户管理员统一创建自建应用凭据模板并下发，或由管理员在后台统一审批权限并发布应用版本。
 
-1. **Hub 服务端配置**：Hub 服务端无需在全局配置任何飞书 App ID 或 Secret，仅需确保 Hub 启动时配置了外部可解析的 `-public-url`（例如 `https://hub.example.com`）。
-2. **创建飞书自建应用**：开发者或管理员登录飞书开放平台（open.feishu.cn），创建自建应用（例如“张三的开发助手”），在应用凭证页面获取 `App ID`（形如 `cli_...`）、`App Secret`、`Verification Token` 以及可选的 `Encrypt Key`。
-3. **在 Web 控制台完成凭据绑定**：开发者登录 TalkIntent Web 控制台，进入「飞书 Bot 绑定」标签页，填入上述四项凭据并保存。Hub 使用服务端的 AES-256 主密钥（`master.key`）加密持久化凭据。
-4. **配置飞书事件订阅请求网址**：保存后控制台将显示该成员专属的 Webhook 地址（格式为 `https://hub.example.com/api/v1/feishu/webhook/<member_id>`）。将其填入飞书开放平台「事件与回调」的请求网址中。Hub 收到飞书的验证包后会自动应答 `{"challenge": "..."}` 完成握手。
-5. **添加事件与申请权限**：在飞书后台添加 `im.message.receive_v1`（接收消息 v2.0）事件，申请开通 `im:message` 与 `im:message:send_as_bot` 权限，并发布应用版本。
+1. **创建企业自建应用**：访问 [飞书开放平台 (open.feishu.cn)](https://open.feishu.cn)，使用企业开发者账号登录，点击「创建自建应用」（例如命名为“TalkIntent 协同助手”）。在应用详情页「凭证与基础信息」中获取 `App ID`（形如 `cli_...`）与 `App Secret`（仅需这两项凭据，无需 Verification Token 或 Encrypt Key）。
+2. **添加机器人能力**：在应用详情页「添加应用能力」中选择「机器人」，开启机器人能力。
+3. **配置权限范围**：在「开发配置」-「权限管理」中添加以下权限并开通：
+   - `im:message`（获取与发送单聊、群消息）
+   - `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息）
+   - `im:message:send_as_bot`（以应用身份发送消息）
+4. **Web 控制台保存凭据（必须先做！）**：登录 TalkIntent Web 控制台（`http://<hub_addr>/web`），切换至「飞书 Bot 绑定」标签页，在表单中填入 `App ID` 与 `App Secret`（`Base URL` 选填，默认 `https://open.feishu.cn`），点击「保存飞书配置」。凭据经服务端 AES-GCM-256 加密落盘，Hub 立即在后台发起端点探测与长连接建连。
+5. **飞书开放平台切换为长连接模式（关键操作顺序）**：
+   在 Web 控制台点击「刷新状态」，确认状态徽标显示为绿色「已连接 (长连接)」。
+   此时前往飞书开放平台「开发配置」-「事件与回调」，在订阅方式中选择「使用长连接接收事件 (WebSocket)」。
+   **关键操作顺序提示**：飞书开放平台控制台存在硬性校验机制——在点击保存长连接配置时，飞书服务端会即时探测该应用是否已有活跃的长连接客户端连入。若尚未在 TalkIntent Web 控制台保存配置建连，飞书控制台将直接拦截并报错“需先建立长连接才能保存配置”。因此，务必遵守**先在 TalkIntent 保存凭据至已连接，再在飞书控制台保存长连接订阅**的操作顺序。
+6. **添加事件订阅**：在飞书开放平台「事件与回调」-「添加事件」中，搜索并添加 `im.message.receive_v1`（接收消息 v2.0）事件。
+7. **创建版本并发布上线**：进入「应用发布」-「版本管理与发布」，点击「创建版本」，填写版本号与更新说明后提交发布。若企业设置了应用审核策略，需由租户管理员在飞书管理后台审批通过；免审租户发布后即刻生效。
 
-### 8.3 交互机制与双向审计
-飞书用户在单聊私聊或在群聊中 `@Bot` 发送问题后，飞书服务器向 Hub 的 Webhook 投递事件。Hub 校验签名并在 3 秒 SLA 内立即返回 HTTP 200 `{}`，随后异步向该成员的本地 Daemon 下发感知提问。
+### 8.3 状态指示灯与运维语义
+在 Web 控制台「飞书 Bot 绑定」页面中，状态指示徽标提供实时长连接运行状态反馈：
 
-若被提问成员处于离线状态，Hub 会立即调用飞书接口回复离线排队提示。待探针执行完成后，Hub 自动刷新 `tenant_access_token` 并调用飞书回复接口（`POST /open-apis/im/v1/messages/<msg_id>/reply`）将答案异步推回飞书。所有来自飞书的提问均被记录在 Hub 事件流中，被提问者可通过 `talkintent history -inbound` 追溯提问者的飞书用户 ID、提问内容、调用的工具与给出的答复。
+| 状态徽标 | 内部状态 | 语义说明与系统行为 |
+| :--- | :--- | :--- |
+| `已连接 (长连接)` | `connected` | 正常连通。Hub 与飞书建立 PBBP2 二进制长连接，周期性执行双向 Ping/Pong 心跳（默认 120 秒），就绪接收事件。 |
+| `连接中...` | `connecting` | 建连或重连中。Hub 正在调用 `/callback/ws/endpoint` 探测端点，或在网络波动后处于退避等待窗口。 |
+| `未连接` | `disconnected` | 连接处于空闲或离线状态，尚未建立活动套接字。 |
+| `连接错误` | `error` | 发生非重试性错误（如凭据无效被飞书拒绝）或多次重连超限。卡片将输出具体的错误详情，便于定位。 |
+| `未绑定` | 未配置 | 尚未保存飞书 Bot 凭据。 |
+
+徽标旁还会显示本次连接建立时间（`连接于: HH:MM:SS`）以及自 Hub 启动或本次保存凭据以来成功重连的累计次数（`重连: N 次`，为 0 时不显示）。重连次数持续增长通常意味着 Hub 与飞书网关之间的网络不稳定，可配合 Hub 日志中的 `Feishu WebSocket connection lost` 记录排查。
+
+### 8.4 独占应用部署约束与多实例事件分流警告
+**重要部署约束：严禁多个 Hub 实例或外部客户端共享同一个飞书 App ID**。
+飞书开放平台长连接网关采用客户端集群负载均衡策略：当同一个 `App ID` 存在多个活跃的 WebSocket 长连接客户端时，飞书会将接收到的消息事件随机散列分发至各个连接。若两个 TalkIntent Hub 实例配置了相同的 App ID，发给机器人的提问将被随机切分，导致部分提问在某一个 Hub 上完全失联、无法触发探针回答。因此，**每一个 TalkIntent Hub 独立部署环境必须在飞书开放平台创建并绑定其专属的自建应用，禁止跨环境复用**。
+
+### 8.5 交互流程与双向审计
+飞书用户在单聊私聊向 Bot 发送问题后，飞书网关通过 WebSocket 推送 PBBP2 二进制数据帧。Hub 自动应答带有 `biz_rt` 耗时指标的确认帧，重组分片报文，随即把问题作为一次普通提问投递给目标成员的本地 Daemon 执行探针任务。若被提问成员离线，Hub 异步调用飞书 API 发送排队提醒；待探针执行完毕后，Hub 自动刷新 `tenant_access_token` 并调用飞书回复接口（`POST /open-apis/im/v1/messages/{message_id}/reply`）将结构化回答发送至原消息线程。全部交互均写入 `events.jsonl`，成员可通过 `talkintent history -inbound` 追溯飞书来源的提问详情与工具调用。
 
 ## 9. 常见故障诊断与排查指南
 
-以下汇集了 TalkIntent 部署与运行中最常见的 8 种故障现象、系统精确报错输出与标准处置方案。
+以下汇集了 TalkIntent 部署与运行中最常见的 13 种故障现象、系统精确报错输出与标准处置方案。
 
 | 故障现象与场景 | 系统精确报错输出 | 根因分析 | 处置与修复措施 |
 | :--- | :--- | :--- | :--- |
@@ -606,3 +642,8 @@ TalkIntent 在 `internal/feishu` 中完整实现了飞书开放平台企业自�
 | 6. 私有网关 TLS 握手失败 | `x509: certificate signed by unknown authority` 或 `x509: certificate is valid for <domain>, not <ip>` | 内网网关使用自建私有 CA 签发证书未被信任，或通过 IP 直连导致证书域名与 SNI 不符 | 执行 `llm set` 时通过 `-ca-file` 传入 PEM 格式根证书，并传入 `-tls-server-name <domain>` 覆盖 SNI 主机名校验。私网测试环境下亦可传入 `-insecure-skip-verify` 跳过校验。 |
 | 7. 触碰主权隐私守则判定拒答 | 控制台输出 `Status: refused`，`Reason: ...`，CLI 进程退出码为 `1` | 提问触碰了对方工作区的 `privacy-prompt.md` 规则，探针执行 `refuse` 结构化控制工具 | 属于系统隐私保护机制的预期行为。若在自动化脚本（`set -e`）中调用，命令尾部必须追加 `\|\| true` 防止脚本中断。 |
 | 8. 关闭终端后守护进程退出 | 终端关闭后再次执行 `daemon status` 显示 `Daemon: NOT RUNNING` | 启动守护进程时未加 `-detach` 参数，导致进程挂载在前台终端，随终端关闭一同退出 | 必须使用脱离模式启动：执行 `talkintent daemon start -detach`，并执行 `talkintent daemon status` 确认后台存活。 |
+| 9. 飞书控制台无法保存长连接 | `需先建立长连接才能保存配置` 或控制台提示保存失败 | 操作顺序颠倒：在飞书控制台保存长连接配置时，TalkIntent Hub 尚未与飞书建立长连接 | 必须先在 TalkIntent Web 控制台录入 App ID 与 App Secret 并点击保存，确认状态徽标变为「已连接 (长连接)」后，再去飞书控制台保存长连接模式。 |
+| 10. 飞书 Bot 状态显示连接错误 | 状态徽标为 `连接错误`，错误详情形如 `feishu client error (code ...)`（端点探测被飞书拒绝，不再重试）或 `feishu server error (code ...)` / `dial tcp ...`（可重试，重连超限后转为错误） | App ID 或 App Secret 填写错误；或机房出站防火墙拦截了 `open.feishu.cn:443` 及端点探测返回的 `wss://` WebSocket 网关域名 | 重新核对并更新凭据；检查 Hub 服务器出站连通性与代理设置，确保 Hub 进程可正常访问飞书 OpenAPI 与其返回的 WebSocket 网关域名。 |
+| 11. 飞书向 Bot 发消息无应答 | 用户在飞书向机器人发消息，无任何回复或排队提示 | 缺少 `im.message.receive_v1` 事件订阅、未开通 `im:message.p2p_msg:readonly` 权限，或修改后未发布新版本 | 检查飞书后台是否订阅了 `im.message.receive_v1` 并开通对应权限；确认在「版本管理与发布」中创建了新版本且已发布上线（租户管理员已审批）。 |
+| 12. 飞书消息偶发丢失无响应 | 部分飞书提问能收到回答，另一些提问完全无反应且审计无记录 | 多个 TalkIntent Hub 实例或测试客户端共用了同一个飞书 App ID，飞书将消息事件负载均衡切分到了其他客户端 | 严格遵循单应用独占约束：每个 Hub 部署必须在飞书开放平台创建并绑定独立的专属自建应用，禁止跨实例复用同一 App ID。 |
+| 13. 自定义 Base URL 握手失败 | `feishu client error: invalid base url` 或 `connection refused` | 填写的 Base URL 格式错误，或触发了 Hub 的安全 SSRF 校验规则（非回环 HTTP、Link-Local IP、云元数据地址被拒） | 官方国内租户无需填写 Base URL（默认留空即使用 `https://open.feishu.cn`）；海外 Lark 填入 `https://open.larksuite.com`；私有网关确保符合合规公网 HTTPS 或本地回环要求。 |

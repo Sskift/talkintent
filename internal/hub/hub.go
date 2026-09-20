@@ -42,6 +42,8 @@ type HubServer struct {
 	httpServer    *http.Server
 	listener      net.Listener
 	feishuHandler *feishu.Handler
+	feishuMu      sync.Mutex
+	feishuClients map[string]*feishu.WSClient
 	rateLimiter   *rateLimiter
 	stopCh        chan struct{}
 
@@ -130,11 +132,12 @@ func NewServer(cfg *config.HubConfig, st store.Store, webFS fs.FS, logger *slog.
 		queryWaiters:     make(map[string][]chan *protocol.QueryDetailResponse),
 		queryTimeouts:    make(map[string]int),
 		idempotencyCache: make(map[string]idempotencyRecord),
+		feishuClients:    make(map[string]*feishu.WSClient),
 		rateLimiter:      newRateLimiter(qpm, burst),
 		stopCh:           make(chan struct{}),
 	}
 
-	// Initialize Feishu Webhook & Reply Handler (WP5 integration, F40)
+	// Initialize Feishu Reply Handler (WP5 integration, F40)
 	feishuCfg := feishu.HandlerConfig{
 		BindingLookup: func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error) {
 			return h.store.GetFeishuBinding(ctx, memberID)
@@ -207,6 +210,15 @@ func (h *HubServer) Start(ctx context.Context) error {
 	h.mu.Unlock()
 	h.logger.Info("TalkIntent Hub listening", "addr", ln.Addr().String(), "data_dir", h.cfg.DataDir)
 
+	// Start Feishu long-connection clients for all configured bindings
+	if bindings, err := h.store.ListFeishuBindings(ctx); err == nil {
+		h.feishuMu.Lock()
+		for mid, b := range bindings {
+			h.startFeishuClientLocked(mid, b)
+		}
+		h.feishuMu.Unlock()
+	}
+
 	// Background ticker for sweeping expired queries and notifying waiters (F19/F41)
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
@@ -274,7 +286,38 @@ func (h *HubServer) Stop(ctx context.Context) error {
 		close(h.stopCh)
 	}
 
-	// Gracefully close all connected WebSocket sessions
+	// 1. Shutdown HTTP server first to reject new requests and drain in-flight requests
+	shutdownErr := h.httpServer.Shutdown(ctx)
+
+	// 2. Stop all Feishu long-connection clients to halt incoming Feishu events
+	h.feishuMu.Lock()
+	feishuToStop := make([]*feishu.WSClient, 0, len(h.feishuClients))
+	for mid, cli := range h.feishuClients {
+		feishuToStop = append(feishuToStop, cli)
+		delete(h.feishuClients, mid)
+	}
+	h.feishuMu.Unlock()
+	if len(feishuToStop) > 0 {
+		var feishuWg sync.WaitGroup
+		for _, cli := range feishuToStop {
+			feishuWg.Add(1)
+			go func(c *feishu.WSClient) {
+				defer feishuWg.Done()
+				c.Stop()
+			}(cli)
+		}
+		doneCh := make(chan struct{})
+		go func() {
+			feishuWg.Wait()
+			close(doneCh)
+		}()
+		select {
+		case <-doneCh:
+		case <-ctx.Done():
+		}
+	}
+
+	// 3. Gracefully close all connected WebSocket daemon sessions
 	h.mu.Lock()
 	for _, sess := range h.sessionsByID {
 		sess.closed = true
@@ -285,9 +328,9 @@ func (h *HubServer) Stop(ctx context.Context) error {
 	h.daemonConns = make(map[string]*daemonSession)
 	h.mu.Unlock()
 
-	if err := h.httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
 		_ = h.httpServer.Close()
-		return err
+		return shutdownErr
 	}
 	return nil
 }
@@ -314,11 +357,10 @@ func (h *HubServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/audit/inbound", h.handleAuditInbound)
 	mux.HandleFunc("GET /api/v1/audit/outbound", h.handleAuditOutbound)
 
-	// Feishu Integration & Webhooks
+	// Feishu Integration (Long Connection)
 	mux.HandleFunc("GET /api/v1/feishu/binding", h.handleFeishuBindingGet)
 	mux.HandleFunc("POST /api/v1/feishu/binding", h.handleFeishuBindingSave)
 	mux.HandleFunc("DELETE /api/v1/feishu/binding", h.handleFeishuBindingDelete)
-	mux.HandleFunc("POST /api/v1/feishu/webhook/", h.feishuHandler.ServeHTTP)
 
 	// Static Web UI
 	if h.webFS != nil {
@@ -698,7 +740,7 @@ func (h *HubServer) handleDaemonEnvelope(ctx context.Context, sess *daemonSessio
 			_ = h.store.UpdateQueryStatus(ctx, resp.QueryID, status, resp.Answer, resp.ToolsUsed, resp.DurationMS, resp.TokenUsage, resp.ErrorMessage)
 			h.notifyWaiters(resp.QueryID)
 
-			// Asynchronous Feishu reply if originated from Feishu bot webhook (F40)
+			// Asynchronous Feishu reply if originated from Feishu bot (F40)
 			if existingQ.FeishuContext != nil && existingQ.FeishuContext.MessageID != "" && h.feishuHandler != nil {
 				updatedQ, err := h.store.GetQuery(ctx, resp.QueryID)
 				if err == nil {
@@ -1353,14 +1395,58 @@ func (h *HubServer) handleFeishuBindingGet(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusNotFound, protocol.ErrCodeNotFound, "binding not found")
 		return
 	}
-	webhookURL := fmt.Sprintf("%s/api/v1/feishu/webhook/%s", h.publicURL(r), mem.ID)
+	status := "disconnected"
+	var lastErr string
+	var connectedAt string
+	var reconnects int
+	h.feishuMu.Lock()
+	if cli, ok := h.feishuClients[mem.ID]; ok {
+		status, lastErr, connectedAt, reconnects = cli.LiveStatus()
+	}
+	h.feishuMu.Unlock()
+
 	resp := protocol.FeishuBindingResponse{
-		Bound:      binding != nil && binding.AppID != "",
-		AppID:      binding.AppID,
-		WebhookURL: webhookURL,
+		Bound:       binding != nil && binding.AppID != "",
+		AppID:       binding.AppID,
+		Status:      status,
+		Error:       lastErr,
+		ConnectedAt: connectedAt,
+		Reconnects:  reconnects,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func validateFeishuBaseURL(rawURL string) error {
+	u, err := url.ParseRequestURI(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid base_url: %w", err)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("base_url scheme must be https or http")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("base_url host is empty")
+	}
+
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || strings.HasPrefix(host, "169.254.") {
+			return fmt.Errorf("link-local or metadata addresses not allowed in base_url")
+		}
+	}
+	if strings.EqualFold(host, "metadata.google.internal") || strings.EqualFold(host, "instance-data") {
+		return fmt.Errorf("cloud metadata hostnames not allowed in base_url")
+	}
+
+	if u.Scheme == "http" {
+		isLoopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+		if !isLoopback {
+			return fmt.Errorf("http scheme is only allowed for loopback addresses, use https")
+		}
+	}
+	return nil
 }
 
 func (h *HubServer) handleFeishuBindingSave(w http.ResponseWriter, r *http.Request) {
@@ -1374,15 +1460,57 @@ func (h *HubServer) handleFeishuBindingSave(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "invalid json")
 		return
 	}
+	if req.AppID == "" || req.AppSecret == "" {
+		writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, "app_id and app_secret are required")
+		return
+	}
+	if req.BaseURL != "" {
+		if err := validateFeishuBaseURL(req.BaseURL); err != nil {
+			writeJSONError(w, http.StatusBadRequest, protocol.ErrCodeInvalidArgument, err.Error())
+			return
+		}
+	}
 	if err := h.store.SaveFeishuBinding(r.Context(), mem.ID, &req); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
-	webhookURL := fmt.Sprintf("%s/api/v1/feishu/webhook/%s", h.publicURL(r), mem.ID)
+
+	if h.feishuHandler != nil {
+		h.feishuHandler.EvictClient(req.AppID)
+	}
+
+	h.feishuMu.Lock()
+	existing := h.feishuClients[mem.ID]
+	delete(h.feishuClients, mem.ID)
+	h.feishuMu.Unlock()
+
+	if existing != nil {
+		existing.Stop()
+	}
+
+	cfg := feishu.WSClientConfig{
+		MemberID:  mem.ID,
+		AppID:     req.AppID,
+		AppSecret: req.AppSecret,
+		BaseURL:   req.BaseURL,
+		EventHandler: func(ctx context.Context, payload []byte) error {
+			return h.feishuHandler.ProcessEvent(ctx, mem.ID, payload)
+		},
+		Logger: h.logger,
+	}
+	cli := feishu.NewWSClient(cfg)
+	cli.Start()
+
+	h.feishuMu.Lock()
+	h.feishuClients[mem.ID] = cli
+	status, _ := cli.Status()
+	h.feishuMu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success":     true,
-		"webhook_url": webhookURL,
+	_ = json.NewEncoder(w).Encode(protocol.FeishuBindingResponse{
+		Bound:  true,
+		AppID:  req.AppID,
+		Status: status,
 	})
 }
 
@@ -1392,9 +1520,61 @@ func (h *HubServer) handleFeishuBindingDelete(w http.ResponseWriter, r *http.Req
 		writeJSONError(w, http.StatusUnauthorized, protocol.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
+	oldBinding, _ := h.store.GetFeishuBinding(r.Context(), mem.ID)
 	if err := h.store.DeleteFeishuBinding(r.Context(), mem.ID); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, protocol.ErrCodeInternalError, err.Error())
 		return
 	}
+
+	if oldBinding != nil && h.feishuHandler != nil {
+		h.feishuHandler.EvictClient(oldBinding.AppID)
+	}
+
+	h.feishuMu.Lock()
+	existing := h.feishuClients[mem.ID]
+	delete(h.feishuClients, mem.ID)
+	h.feishuMu.Unlock()
+
+	if existing != nil {
+		existing.Stop()
+	}
+
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *HubServer) startFeishuClientLocked(memberID string, binding *protocol.FeishuBindingRequest) {
+	if existing, ok := h.feishuClients[memberID]; ok {
+		existing.Stop()
+		delete(h.feishuClients, memberID)
+	}
+	if binding == nil || binding.AppID == "" || binding.AppSecret == "" {
+		return
+	}
+	cfg := feishu.WSClientConfig{
+		MemberID:  memberID,
+		AppID:     binding.AppID,
+		AppSecret: binding.AppSecret,
+		BaseURL:   binding.BaseURL,
+		EventHandler: func(ctx context.Context, payload []byte) error {
+			return h.feishuHandler.ProcessEvent(ctx, memberID, payload)
+		},
+		Logger: h.logger,
+	}
+	cli := feishu.NewWSClient(cfg)
+	cli.Start()
+	h.feishuClients[memberID] = cli
+}
+
+func (h *HubServer) stopFeishuClientLocked(memberID string) {
+	if cli, ok := h.feishuClients[memberID]; ok {
+		cli.Stop()
+		delete(h.feishuClients, memberID)
+	}
+}
+
+// FeishuClientForTest returns the active Feishu WSClient for a member, for test inspection.
+func (h *HubServer) FeishuClientForTest(memberID string) *feishu.WSClient {
+	h.feishuMu.Lock()
+	defer h.feishuMu.Unlock()
+	return h.feishuClients[memberID]
 }

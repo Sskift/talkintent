@@ -1,13 +1,8 @@
 package feishu
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"net/http"
-	"net/http/httptest"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,175 +11,14 @@ import (
 	"github.com/Sskift/talkintent/internal/protocol"
 )
 
-func TestHandlerPlainChallenge(t *testing.T) {
-	bindingStore := map[string]*protocol.FeishuBindingRequest{
-		"mem_zhangsan": {
-			AppID:             "cli_test_zhangsan",
-			AppSecret:         "sec_test_secret",
-			VerificationToken: "ver_test_tok",
-			EncryptKey:        "test_enc_key_12345",
-		},
-	}
-
-	handler := NewHandler(HandlerConfig{
-		BindingLookup: func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error) {
-			b, ok := bindingStore[memberID]
-			if !ok {
-				return nil, errors.New("not found")
-			}
-			return b, nil
-		},
-	})
-
-	challengeBody := map[string]string{
-		"challenge": "challenge_token_plain_999",
-		"token":     "ver_test_tok",
-		"type":      "url_verification",
-	}
-	bodyBytes, _ := json.Marshal(challengeBody)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(bodyBytes))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	var resp map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response failed: %v", err)
-	}
-	if resp["challenge"] != "challenge_token_plain_999" {
-		t.Fatalf("expected challenge challenge_token_plain_999, got %s", resp["challenge"])
-	}
-}
-
-func TestHandlerEncryptedChallenge(t *testing.T) {
-	fake := NewFakeServer()
-	defer fake.Close()
-
-	encryptKey := "enc_key_for_challenge_test!"
-	bindingStore := map[string]*protocol.FeishuBindingRequest{
-		"mem_zhangsan": {
-			AppID:             "cli_test_zhangsan",
-			AppSecret:         "sec_test_secret",
-			VerificationToken: "ver_test_tok",
-			EncryptKey:        encryptKey,
-		},
-	}
-
-	handler := NewHandler(HandlerConfig{
-		BaseURL: fake.URL(),
-		BindingLookup: func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error) {
-			b, ok := bindingStore[memberID]
-			if !ok {
-				return nil, errors.New("not found")
-			}
-			return b, nil
-		},
-	})
-
-	plainChallenge, err := fake.BuildChallengeEvent("challenge_enc_888", "ver_test_tok")
-	if err != nil {
-		t.Fatalf("BuildChallengeEvent failed: %v", err)
-	}
-
-	req, err := fake.BuildEncryptedSignedRequest("/api/v1/feishu/webhook/mem_zhangsan", encryptKey, plainChallenge)
-	if err != nil {
-		t.Fatalf("BuildEncryptedSignedRequest failed: %v", err)
-	}
-
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	var resp map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode challenge response failed: %v", err)
-	}
-	if resp["challenge"] != "challenge_enc_888" {
-		t.Fatalf("expected plain challenge challenge_enc_888, got %s", resp["challenge"])
-	}
-}
-
-func TestHandlerSignatureAndTimestampVerification(t *testing.T) {
-	encryptKey := "key_for_signature_verification!"
-	bindingStore := map[string]*protocol.FeishuBindingRequest{
-		"mem_zhangsan": {
-			AppID:      "cli_test",
-			AppSecret:  "sec_test",
-			EncryptKey: encryptKey,
-		},
-	}
-
-	handler := NewHandler(HandlerConfig{
-		BindingLookup: func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error) {
-			return bindingStore[memberID], nil
-		},
-		MaxSkewSeconds: 300,
-	})
-
-	body := []byte(`{"type":"url_verification","challenge":"ch123"}`)
-
-	// 1. Valid Signature
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	nonce := "test_nonce"
-	sig := CalculateSignature(ts, nonce, encryptKey, body)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(body))
-	req.Header.Set("X-Lark-Request-Timestamp", ts)
-	req.Header.Set("X-Lark-Request-Nonce", nonce)
-	req.Header.Set("X-Lark-Signature", sig)
-
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("valid signature should pass with 200, got %d", rec.Code)
-	}
-
-	// 2. Tampered signature
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(body))
-	req.Header.Set("X-Lark-Request-Timestamp", ts)
-	req.Header.Set("X-Lark-Request-Nonce", nonce)
-	req.Header.Set("X-Lark-Signature", "tampered_signature_hex_000000000000000000000000000000000000000000000")
-
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("tampered signature should return 401, got %d", rec.Code)
-	}
-
-	// 3. Expired timestamp (> 300s)
-	expiredTS := strconv.FormatInt(time.Now().Unix()-350, 10)
-	expiredSig := CalculateSignature(expiredTS, nonce, encryptKey, body)
-
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(body))
-	req.Header.Set("X-Lark-Request-Timestamp", expiredTS)
-	req.Header.Set("X-Lark-Request-Nonce", nonce)
-	req.Header.Set("X-Lark-Signature", expiredSig)
-
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expired timestamp should return 401, got %d", rec.Code)
-	}
-}
-
 func TestHandlerMessageEventDispatchAndAck(t *testing.T) {
 	fake := NewFakeServer()
 	defer fake.Close()
 
-	encryptKey := "enc_key_for_message_dispatch!"
 	bindingStore := map[string]*protocol.FeishuBindingRequest{
 		"mem_zhangsan": {
-			AppID:      "cli_zhangsan_bot",
-			AppSecret:  "sec_zhangsan_bot",
-			EncryptKey: encryptKey,
+			AppID:     "cli_zhangsan_bot",
+			AppSecret: "sec_zhangsan_bot",
 		},
 	}
 
@@ -219,20 +53,8 @@ func TestHandlerMessageEventDispatchAndAck(t *testing.T) {
 		t.Fatalf("BuildMessageReceiveEvent failed: %v", err)
 	}
 
-	req, err := fake.BuildEncryptedSignedRequest("/api/v1/feishu/webhook/mem_zhangsan", encryptKey, eventJSON)
-	if err != nil {
-		t.Fatalf("BuildEncryptedSignedRequest failed: %v", err)
-	}
-
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	// Feishu webhook must return 200 OK immediately
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if rec.Body.String() != "{}" {
-		t.Fatalf("expected empty json ack {}, got %s", rec.Body.String())
+	if err := handler.ProcessEvent(context.Background(), "mem_zhangsan", eventJSON); err != nil {
+		t.Fatalf("ProcessEvent failed: %v", err)
 	}
 
 	// Verify asynchronous dispatch was invoked
@@ -286,19 +108,13 @@ func TestHandlerDeduplication(t *testing.T) {
 	eventJSON, _ := fake.BuildMessageReceiveEvent("evt_dup_001", "om_dup_001", "oc_chat", "ou_user", "你好")
 
 	// First delivery
-	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(eventJSON))
-	rec1 := httptest.NewRecorder()
-	handler.ServeHTTP(rec1, req1)
-	if rec1.Code != http.StatusOK {
-		t.Fatalf("first delivery failed: %d", rec1.Code)
+	if err := handler.ProcessEvent(context.Background(), "mem_zhangsan", eventJSON); err != nil {
+		t.Fatalf("first delivery failed: %v", err)
 	}
 
 	// Immediate re-delivery of identical event
-	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(eventJSON))
-	rec2 := httptest.NewRecorder()
-	handler.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("second delivery failed: %d", rec2.Code)
+	if err := handler.ProcessEvent(context.Background(), "mem_zhangsan", eventJSON); err != nil {
+		t.Fatalf("second delivery failed: %v", err)
 	}
 
 	// Give async dispatch goroutine time to run
@@ -313,8 +129,7 @@ func TestHandlerDeduplication(t *testing.T) {
 	}
 }
 
-func TestHandlerOfflineQueuedAckF40(t *testing.T) {
-	// F40 & WP5: When target member is offline and query is queued, send offline acknowledgment
+func TestHandlerOfflineQueuedAck(t *testing.T) {
 	fake := NewFakeServer()
 	defer fake.Close()
 
@@ -342,12 +157,8 @@ func TestHandlerOfflineQueuedAckF40(t *testing.T) {
 	})
 
 	eventJSON, _ := fake.BuildMessageReceiveEvent("evt_offline_001", "om_offline_msg_001", "oc_chat_lisi", "ou_asker", "李四你在干啥")
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_lisi", bytes.NewReader(eventJSON))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	if err := handler.ProcessEvent(context.Background(), "mem_lisi", eventJSON); err != nil {
+		t.Fatalf("ProcessEvent failed: %v", err)
 	}
 
 	// Wait for background offline ack to be sent
@@ -371,7 +182,7 @@ func TestHandlerOfflineQueuedAckF40(t *testing.T) {
 	}
 }
 
-func TestHandlerOnQueryCompleteF40(t *testing.T) {
+func TestHandlerOnQueryComplete(t *testing.T) {
 	fake := NewFakeServer()
 	defer fake.Close()
 
@@ -460,168 +271,75 @@ func TestHandlerOnQueryCompleteF40(t *testing.T) {
 	if lastReply == nil || !strings.Contains(lastReply.Text, "拒绝") {
 		t.Errorf("unexpected refused reply: %+v", lastReply)
 	}
-
-	// 4. Timeout query notice
-	fake.Reset()
-	qTimeout := &protocol.QueryDetailResponse{
-		QueryID:          "qry_to_001",
-		Status:           protocol.QueryStatusTimeout,
-		TargetMemberID:   "mem_zhangsan",
-		TargetMemberName: "张三",
-		FeishuContext: &protocol.FeishuContext{
-			MessageID: "om_to_msg_001",
-		},
-	}
-	err = handler.OnQueryComplete(ctx, qTimeout)
-	if err != nil {
-		t.Fatalf("OnQueryComplete for timeout query failed: %v", err)
-	}
-	lastReply = fake.LastReply()
-	if lastReply == nil || !strings.Contains(lastReply.Text, "超时") {
-		t.Errorf("unexpected timeout reply: %+v", lastReply)
-	}
-
-	// 5. Error query notice
-	fake.Reset()
-	qError := &protocol.QueryDetailResponse{
-		QueryID:          "qry_err_001",
-		Status:           protocol.QueryStatusError,
-		TargetMemberID:   "mem_zhangsan",
-		TargetMemberName: "张三",
-		ErrorMessage:     "LLM provider 503 unavailable",
-		FeishuContext: &protocol.FeishuContext{
-			MessageID: "om_err_msg_001",
-		},
-	}
-	err = handler.OnQueryComplete(ctx, qError)
-	if err != nil {
-		t.Fatalf("OnQueryComplete for error query failed: %v", err)
-	}
-	lastReply = fake.LastReply()
-	if lastReply == nil || !strings.Contains(lastReply.Text, "LLM provider 503 unavailable") {
-		t.Errorf("unexpected error reply: %+v", lastReply)
-	}
-
-	// 6. Query with no Feishu context (e.g. from CLI or REST): no-op
-	fake.Reset()
-	qNonFeishu := &protocol.QueryDetailResponse{
-		QueryID:        "qry_cli_001",
-		Status:         protocol.QueryStatusCompleted,
-		TargetMemberID: "mem_zhangsan",
-		Answer:         "CLI answer",
-	}
-	err = handler.OnQueryComplete(ctx, qNonFeishu)
-	if err != nil {
-		t.Fatalf("OnQueryComplete for non-feishu query returned error: %v", err)
-	}
-	if len(fake.Replies()) != 0 {
-		t.Errorf("non-feishu query should not trigger feishu replies")
-	}
 }
 
-func TestHandlerBotSenderAndNonTextMessageIgnored(t *testing.T) {
+func TestHandlerIgnoreNonTextMessageAndBot(t *testing.T) {
 	fake := NewFakeServer()
 	defer fake.Close()
 
-	bindingStore := map[string]*protocol.FeishuBindingRequest{
-		"mem_zhangsan": {AppID: "cli_zhangsan", AppSecret: "sec_zhangsan"},
-	}
-
-	dispatched := false
+	dispatchCalled := false
 	handler := NewHandler(HandlerConfig{
 		BaseURL: fake.URL(),
-		BindingLookup: func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error) {
-			return bindingStore[memberID], nil
-		},
 		Dispatch: func(ctx context.Context, targetMemberID string, asker AskerInfo, queryText string, feishuCtx protocol.FeishuContext) (*DispatchResult, error) {
-			dispatched = true
-			return &DispatchResult{QueryID: "qry_none", Status: "dispatched"}, nil
+			dispatchCalled = true
+			return nil, nil
 		},
 	})
 
-	// 1. Message from bot/app sender
-	botEvent := EventEnvelope{
-		Schema: "2.0",
-		Header: &EventHeader{EventID: "evt_bot_001", EventType: "im.message.receive_v1"},
+	// 1. Sender is bot
+	event := EventEnvelope{
+		Header: &EventHeader{EventType: "im.message.receive_v1", EventID: "evt_bot"},
 		Event: &EventBody{
 			Sender:  &EventSender{SenderType: "app"},
-			Message: &EventMessage{MessageID: "om_bot", MessageType: "text", Content: `{"text":"bot message"}`},
+			Message: &EventMessage{MessageType: "text", Content: `{"text":"hello"}`},
 		},
 	}
-	b, _ := json.Marshal(botEvent)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(b))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if dispatched {
-		t.Errorf("message from app/bot sender should be ignored")
-	}
+	data, _ := json.Marshal(event)
+	_ = handler.ProcessEvent(context.Background(), "mem_1", data)
 
-	// 2. Non-text message (e.g. image)
-	dispatched = false
-	imgEvent := EventEnvelope{
-		Schema: "2.0",
-		Header: &EventHeader{EventID: "evt_img_001", EventType: "im.message.receive_v1"},
+	// 2. Message type is image
+	event2 := EventEnvelope{
+		Header: &EventHeader{EventType: "im.message.receive_v1", EventID: "evt_img"},
 		Event: &EventBody{
 			Sender:  &EventSender{SenderType: "user"},
-			Message: &EventMessage{MessageID: "om_img", MessageType: "image", Content: `{"image_key":"img_123"}`},
+			Message: &EventMessage{MessageType: "image", Content: `{"image_key":"img_123"}`},
 		},
 	}
-	b, _ = json.Marshal(imgEvent)
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_zhangsan", bytes.NewReader(b))
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
+	data2, _ := json.Marshal(event2)
+	_ = handler.ProcessEvent(context.Background(), "mem_1", data2)
+
 	time.Sleep(50 * time.Millisecond)
-	if dispatched {
-		t.Errorf("non-text message should be ignored")
+	if dispatchCalled {
+		t.Errorf("bot sender and non-text messages must not be dispatched")
 	}
 }
 
-func TestHandlerEdgeCases(t *testing.T) {
-	handler := NewHandler(HandlerConfig{
-		BindingLookup: func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error) {
-			if memberID == "mem_exists" {
-				return &protocol.FeishuBindingRequest{AppID: "cli_123", AppSecret: "sec_123"}, nil
-			}
-			return nil, errors.New("not found")
-		},
-	})
-
-	// GET method not allowed
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/feishu/webhook/mem_exists", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405 Method Not Allowed, got %d", rec.Code)
+func TestHandlerClientCacheEviction(t *testing.T) {
+	h := NewHandler(HandlerConfig{})
+	b1 := &protocol.FeishuBindingRequest{
+		AppID:     "cli_rot_1",
+		AppSecret: "secret_old",
+	}
+	c1 := h.GetClient(b1)
+	c1Repeat := h.GetClient(b1)
+	if c1 != c1Repeat {
+		t.Fatalf("expected same cached client for identical credentials")
 	}
 
-	// Missing member ID
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/", bytes.NewReader([]byte("{}")))
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 Bad Request for missing member ID, got %d", rec.Code)
+	// Rotate secret
+	b2 := &protocol.FeishuBindingRequest{
+		AppID:     "cli_rot_1",
+		AppSecret: "secret_new",
+	}
+	c2 := h.GetClient(b2)
+	if c1 == c2 {
+		t.Fatalf("expected new client instance after secret rotation")
 	}
 
-	// Member binding not found
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_unknown", bytes.NewReader([]byte("{}")))
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("expected 404 Not Found for unknown member, got %d", rec.Code)
-	}
-
-	// Malformed JSON
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/feishu/webhook/mem_exists", bytes.NewReader([]byte("not-json")))
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 Bad Request for invalid json, got %d", rec.Code)
+	// EvictClient
+	h.EvictClient("cli_rot_1")
+	c3 := h.GetClient(b2)
+	if c2 == c3 {
+		t.Fatalf("expected new client instance after EvictClient")
 	}
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -89,22 +90,43 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 func runHubCmd(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hub", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	addr := fs.String("addr", ":8080", "HTTP/WS listen address")
-	dataDir := fs.String("data-dir", "./data", "Storage data directory for JSONL events")
-	adminToken := fs.String("admin-token", "", "Admin token for generating invites (or $TALKINTENT_ADMIN_TOKEN)")
-	publicURL := fs.String("public-url", "", "Public URL for invite generation")
+	addr := fs.String("addr", config.DefaultHubAddr, "HTTP/WS listen address ($TALKINTENT_HUB_ADDR)")
+	dataDir := fs.String("data-dir", "./data", "Storage data directory for JSONL events ($TALKINTENT_DATA_DIR)")
+	adminToken := fs.String("admin-token", "", "Admin token for generating invites ($TALKINTENT_ADMIN_TOKEN)")
+	publicURL := fs.String("public-url", "", "Public URL for invite generation ($TALKINTENT_PUBLIC_URL)")
+	heartbeat := fs.Int("heartbeat", config.DefaultHeartbeatIntervalSec, "Heartbeat interval in seconds ($TALKINTENT_HEARTBEAT_INTERVAL)")
+	defaultQueryTTL := fs.Int("default-query-ttl", config.DefaultQueryTTLSec, "Default query TTL in seconds ($TALKINTENT_DEFAULT_QUERY_TTL)")
+	maxQueryTTL := fs.Int("max-query-ttl", config.MaxQueryTTLSec, "Max query TTL in seconds ($TALKINTENT_MAX_QUERY_TTL)")
+	maxProbeTimeout := fs.Int("max-probe-timeout", config.DefaultMaxProbeTimeoutSec, "Max probe timeout in seconds ($TALKINTENT_MAX_PROBE_TIMEOUT)")
+	rateLimitQPM := fs.Int("rate-limit-qpm", config.DefaultRateLimitQPM, "Rate limit queries per minute ($TALKINTENT_RATE_LIMIT_QPM)")
+	rateLimitBurst := fs.Int("rate-limit-burst", config.DefaultRateLimitBurst, "Rate limit burst ($TALKINTENT_RATE_LIMIT_BURST)")
 	jsonOut := fs.Bool("json", false, "Output in JSON format")
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
 	opts := HubOptions{
-		Addr:       *addr,
-		DataDir:    *dataDir,
-		AdminToken: *adminToken,
-		PublicURL:  *publicURL,
-		JSONOutput: *jsonOut,
+		Addr:                 *addr,
+		DataDir:              *dataDir,
+		AdminToken:           *adminToken,
+		PublicURL:            *publicURL,
+		HeartbeatIntervalSec: *heartbeat,
+		DefaultQueryTTLSec:   *defaultQueryTTL,
+		MaxQueryTTLSec:       *maxQueryTTL,
+		MaxProbeTimeoutSec:   *maxProbeTimeout,
+		RateLimitQPM:         *rateLimitQPM,
+		RateLimitBurst:       *rateLimitBurst,
+		JSONOutput:           *jsonOut,
+		ExplicitFlags:        explicitFlags,
 	}
 	return ExecuteHub(ctx, opts, stdout, stderr)
 }

@@ -805,10 +805,12 @@ function renderDetailTimeline(q) {
 async function loadFeishuBinding() {
   const boundCard = document.getElementById('fs-bound-card');
   const statusBadgeEl = document.getElementById('fs-status-badge');
-  const webhookUrlInput = document.getElementById('fs-webhook-url');
+  const connectedAtEl = document.getElementById('fs-connected-at');
+  const reconnectsEl = document.getElementById('fs-reconnects');
+  const boundAppIdEl = document.getElementById('fs-bound-app-id');
+  const errorMsgEl = document.getElementById('fs-error-msg');
   const appIdInput = document.getElementById('fs-app-id');
   const resultEl = document.getElementById('fs-result');
-  const copyBtn = document.getElementById('fs-copy-webhook-btn');
 
   if (resultEl) resultEl.innerText = '';
 
@@ -827,12 +829,49 @@ async function loadFeishuBinding() {
     const b = await res.json();
     if (b.bound) {
       if (boundCard) boundCard.style.display = 'block';
-      if (statusBadgeEl) {
-        statusBadgeEl.className = 'badge badge-success';
-        statusBadgeEl.innerText = '已绑定飞书应用';
+      if (boundAppIdEl && b.app_id) boundAppIdEl.innerText = `App ID: ${b.app_id}`;
+      if (connectedAtEl) {
+        if (b.connected_at) {
+          const d = new Date(b.connected_at);
+          connectedAtEl.innerText = `连接于: ${d.toLocaleTimeString()}`;
+          connectedAtEl.style.display = 'inline';
+        } else {
+          connectedAtEl.innerText = '';
+          connectedAtEl.style.display = 'none';
+        }
       }
-      if (webhookUrlInput) webhookUrlInput.value = b.webhook_url || '';
-      if (copyBtn) copyBtn.onclick = () => copyText(b.webhook_url || '', 'fs-copy-webhook-btn');
+      if (reconnectsEl) {
+        if (typeof b.reconnects === 'number' && b.reconnects > 0) {
+          reconnectsEl.innerText = `(重连: ${b.reconnects} 次)`;
+          reconnectsEl.style.display = 'inline';
+        } else {
+          reconnectsEl.innerText = '';
+          reconnectsEl.style.display = 'none';
+        }
+      }
+      if (statusBadgeEl) {
+        if (b.status === 'connected') {
+          statusBadgeEl.className = 'badge badge-success';
+          statusBadgeEl.innerText = '已连接 (长连接)';
+        } else if (b.status === 'connecting') {
+          statusBadgeEl.className = 'badge badge-warning';
+          statusBadgeEl.innerText = '连接中...';
+        } else if (b.status === 'error') {
+          statusBadgeEl.className = 'badge badge-danger';
+          statusBadgeEl.innerText = '连接错误';
+        } else {
+          statusBadgeEl.className = 'badge badge-offline';
+          statusBadgeEl.innerText = '未连接';
+        }
+      }
+      if (errorMsgEl) {
+        if (b.error) {
+          errorMsgEl.innerText = `错误信息: ${b.error}`;
+          errorMsgEl.style.display = 'block';
+        } else {
+          errorMsgEl.style.display = 'none';
+        }
+      }
       if (appIdInput && b.app_id) appIdInput.value = b.app_id;
     } else {
       if (boundCard) boundCard.style.display = 'none';
@@ -840,7 +879,6 @@ async function loadFeishuBinding() {
         statusBadgeEl.className = 'badge badge-offline';
         statusBadgeEl.innerText = '未绑定';
       }
-      if (webhookUrlInput) webhookUrlInput.value = '';
     }
   } catch (err) {
     console.error('Load Feishu binding failed', err);
@@ -850,14 +888,12 @@ async function loadFeishuBinding() {
 async function saveFeishuBinding() {
   const appId = (document.getElementById('fs-app-id')?.value || '').trim();
   const appSecret = (document.getElementById('fs-app-secret')?.value || '').trim();
-  const token = (document.getElementById('fs-token')?.value || '').trim();
-  const encryptKey = (document.getElementById('fs-encrypt-key')?.value || '').trim();
   const resultEl = document.getElementById('fs-result');
 
-  if (!appId || !appSecret || !token) {
+  if (!appId || !appSecret) {
     if (resultEl) {
       resultEl.style.color = 'var(--danger)';
-      resultEl.innerText = '请填写完整的 App ID、App Secret 和 Verification Token';
+      resultEl.innerText = '请填写完整的 App ID 和 App Secret';
     }
     return;
   }
@@ -865,8 +901,6 @@ async function saveFeishuBinding() {
   const payload = {
     app_id: appId,
     app_secret: appSecret,
-    verification_token: token,
-    encrypt_key: encryptKey,
   };
 
   try {
@@ -877,10 +911,9 @@ async function saveFeishuBinding() {
     });
 
     if (res.ok) {
-      const data = await res.json();
       if (resultEl) {
         resultEl.style.color = 'var(--success)';
-        resultEl.innerText = '飞书应用配置已安全保存 (Hub 服务端采用 AES-GCM-256 加密存储)。';
+        resultEl.innerText = '飞书应用配置已安全保存并启动长连接 (Hub 服务端采用 AES-GCM-256 加密存储)。';
       }
       showToast('飞书 Bot 配置保存成功', 'success');
       loadFeishuBinding();
@@ -917,9 +950,7 @@ async function deleteFeishuBinding() {
       if (boundCard) boundCard.style.display = 'none';
 
       const secretInput = document.getElementById('fs-app-secret');
-      const encInput = document.getElementById('fs-encrypt-key');
       if (secretInput) secretInput.value = '';
-      if (encInput) encInput.value = '';
 
       loadFeishuBinding();
     } else {

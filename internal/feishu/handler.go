@@ -2,12 +2,11 @@ package feishu
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +48,7 @@ type DispatchFunc func(ctx context.Context, targetMemberID string, asker AskerIn
 // BindingLookupFunc looks up Feishu bot credentials for a target member.
 type BindingLookupFunc func(ctx context.Context, memberID string) (*protocol.FeishuBindingRequest, error)
 
-// HandlerConfig configures the Feishu webhook HTTP handler.
+// HandlerConfig configures the Feishu event handler.
 type HandlerConfig struct {
 	// BindingLookup retrieves Feishu bot credentials for a member. Required.
 	BindingLookup BindingLookupFunc
@@ -60,14 +59,6 @@ type HandlerConfig struct {
 	// BaseURL overrides the Feishu Open Platform API base URL (useful for mock/fake servers).
 	// Default: "https://open.feishu.cn".
 	BaseURL string
-
-	// PathPrefix is stripped from r.URL.Path to determine the member ID.
-	// Default: "/api/v1/feishu/webhook/".
-	PathPrefix string
-
-	// MaxSkewSeconds is the maximum allowed timestamp difference for signature validation (F12).
-	// Default: 300 seconds.
-	MaxSkewSeconds int64
 
 	// Deduplicator deduplicates incoming events and messages.
 	// If nil, a default deduplicator is created.
@@ -80,7 +71,7 @@ type HandlerConfig struct {
 	ClientFactory func(appID, appSecret, baseURL string) *Client
 }
 
-// Handler handles Feishu webhook HTTP callbacks and provides asynchronous reply dispatch.
+// Handler coordinates Feishu event processing and asynchronous reply dispatch.
 type Handler struct {
 	cfg       HandlerConfig
 	dedupe    *Deduplicator
@@ -89,16 +80,10 @@ type Handler struct {
 	clients   map[string]*Client // keyed by appID
 }
 
-// NewHandler creates a new Feishu webhook handler.
+// NewHandler creates a new Feishu event handler.
 func NewHandler(cfg HandlerConfig) *Handler {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://open.feishu.cn"
-	}
-	if cfg.PathPrefix == "" {
-		cfg.PathPrefix = "/api/v1/feishu/webhook/"
-	}
-	if cfg.MaxSkewSeconds <= 0 {
-		cfg.MaxSkewSeconds = 300
 	}
 	dedupe := cfg.Deduplicator
 	if dedupe == nil {
@@ -122,6 +107,20 @@ func (h *Handler) Deduplicator() *Deduplicator {
 	return h.dedupe
 }
 
+// EvictClient removes cached clients matching the specified appID.
+func (h *Handler) EvictClient(appID string) {
+	if appID == "" {
+		return
+	}
+	h.clientsMu.Lock()
+	defer h.clientsMu.Unlock()
+	for k := range h.clients {
+		if k == appID || strings.HasPrefix(k, appID+":") {
+			delete(h.clients, k)
+		}
+	}
+}
+
 // GetClient retrieves or creates a Client for the specified credentials.
 func (h *Handler) GetClient(binding *protocol.FeishuBindingRequest) *Client {
 	if binding == nil {
@@ -130,178 +129,80 @@ func (h *Handler) GetClient(binding *protocol.FeishuBindingRequest) *Client {
 	h.clientsMu.Lock()
 	defer h.clientsMu.Unlock()
 
-	key := binding.AppID
+	baseURL := h.cfg.BaseURL
+	if binding.BaseURL != "" {
+		baseURL = binding.BaseURL
+	}
+
+	secretHash := sha256.Sum256([]byte(binding.AppSecret))
+	key := fmt.Sprintf("%s:%x:%s", binding.AppID, secretHash[:8], baseURL)
 	if client, ok := h.clients[key]; ok {
 		return client
 	}
 
 	var client *Client
 	if h.cfg.ClientFactory != nil {
-		client = h.cfg.ClientFactory(binding.AppID, binding.AppSecret, h.cfg.BaseURL)
+		client = h.cfg.ClientFactory(binding.AppID, binding.AppSecret, baseURL)
 	} else {
-		client = NewClient(binding.AppID, binding.AppSecret, h.cfg.BaseURL)
+		client = NewClient(binding.AppID, binding.AppSecret, baseURL)
 	}
 	h.clients[key] = client
 	return client
 }
 
-// ExtractMemberID resolves the target member ID from the request URL.
-func (h *Handler) ExtractMemberID(r *http.Request) string {
-	if q := r.URL.Query().Get("member_id"); q != "" {
-		return strings.TrimSpace(q)
-	}
-
-	path := r.URL.Path
-	if h.cfg.PathPrefix != "" && strings.HasPrefix(path, h.cfg.PathPrefix) {
-		return strings.Trim(strings.TrimPrefix(path, h.cfg.PathPrefix), "/")
-	}
-
-	if idx := strings.Index(path, "/webhook/"); idx != -1 {
-		return strings.Trim(path[idx+len("/webhook/"):], "/")
-	}
-
-	return strings.Trim(path, "/")
-}
-
-// ServeHTTP implements http.Handler for Feishu webhook subscriptions.
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	memberID := h.ExtractMemberID(r)
-	if memberID == "" {
-		http.Error(w, "missing member id in webhook path", http.StatusBadRequest)
-		return
-	}
-
-	if h.cfg.BindingLookup == nil {
-		http.Error(w, "binding lookup not configured", http.StatusInternalServerError)
-		return
-	}
-
-	binding, err := h.cfg.BindingLookup(r.Context(), memberID)
-	if err != nil || binding == nil {
-		http.Error(w, "feishu binding not found for member", http.StatusNotFound)
-		return
-	}
-
-	rawBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10*1024*1024))
-	if err != nil {
-		http.Error(w, "read request body failed", http.StatusBadRequest)
-		return
-	}
-
-	// 1. Signature and Timestamp Verification (F12)
-	timestamp := r.Header.Get("X-Lark-Request-Timestamp")
-	nonce := r.Header.Get("X-Lark-Request-Nonce")
-	signature := r.Header.Get("X-Lark-Signature")
-
-	if binding.EncryptKey != "" && signature != "" {
-		if !VerifyTimestampFreshness(timestamp, h.cfg.MaxSkewSeconds) {
-			http.Error(w, "expired timestamp", http.StatusUnauthorized)
-			return
-		}
-		if !VerifySignature(timestamp, nonce, binding.EncryptKey, rawBody, signature) {
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	// 2. Parse Envelope
+// ProcessEvent processes an incoming Feishu event payload received via long connection.
+func (h *Handler) ProcessEvent(ctx context.Context, targetMemberID string, rawBody []byte) error {
 	var env EventEnvelope
 	if err := json.Unmarshal(rawBody, &env); err != nil {
-		http.Error(w, "invalid json payload", http.StatusBadRequest)
-		return
+		return fmt.Errorf("invalid json event payload: %w", err)
 	}
 
-	// 3. Plain URL Verification Challenge (PROTOCOL.md §4.1)
-	if env.Type == "url_verification" || (env.Challenge != "" && env.Encrypt == "") {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": env.Challenge})
-		return
-	}
-
-	// 4. Encrypted Payload Decryption (PROTOCOL.md §4.1, F31)
-	if env.Encrypt != "" {
-		if binding.EncryptKey == "" {
-			http.Error(w, "encrypted payload received but no encrypt_key configured", http.StatusBadRequest)
-			return
-		}
-		plainBytes, err := DecryptPayload(env.Encrypt, binding.EncryptKey)
-		if err != nil {
-			http.Error(w, "payload decryption failed: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		// Reset and unmarshal decrypted payload
-		env = EventEnvelope{}
-		if err := json.Unmarshal(plainBytes, &env); err != nil {
-			http.Error(w, "invalid decrypted json payload", http.StatusBadRequest)
-			return
-		}
-
-		// Encrypted URL Verification Challenge
-		if env.Type == "url_verification" || env.Challenge != "" {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			_ = json.NewEncoder(w).Encode(map[string]string{"challenge": env.Challenge})
-			return
-		}
-	}
-
-	// 5. Verify Event Payload
 	if env.Header == nil || env.Event == nil {
-		// Acknowledge other non-event webhooks with 200 OK
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte("{}"))
-		return
+		return nil
 	}
 
 	if env.Header.EventType != "im.message.receive_v1" {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte("{}"))
-		return
+		return nil
 	}
 
 	// Ignore messages sent by apps/bots to prevent reply loops
 	if env.Event.Sender != nil && env.Event.Sender.SenderType != "" && env.Event.Sender.SenderType != "user" {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte("{}"))
-		return
+		return nil
 	}
 
 	msg := env.Event.Message
 	if msg == nil {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte("{}"))
-		return
+		return nil
 	}
 
-	// 6. Deduplication by event_id and message_id
+	// Deduplication by event_id and message_id
 	eventID := env.Header.EventID
 	msgID := msg.MessageID
 	if (eventID != "" && h.dedupe.CheckAndRecord(eventID)) || (msgID != "" && h.dedupe.CheckAndRecord(msgID)) {
-		// Duplicate event, acknowledge immediately without re-dispatching
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte("{}"))
-		return
+		return nil
 	}
 
 	// Only text messages are supported
 	if msg.MessageType != "text" {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte("{}"))
-		return
+		return nil
 	}
 
 	queryText, err := StripMentions(msg.Content, msg.Mentions)
 	if err != nil || queryText == "" {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte("{}"))
-		return
+		return nil
 	}
 
-	// 7. Prepare Asker & Feishu Context
+	var binding *protocol.FeishuBindingRequest
+	if h.cfg.BindingLookup != nil {
+		binding, _ = h.cfg.BindingLookup(ctx, targetMemberID)
+	}
+
+	appID := ""
+	if binding != nil {
+		appID = binding.AppID
+	}
+
+	// Prepare Asker & Feishu Context
 	asker := AskerInfo{
 		ChatID:   msg.ChatID,
 		ChatType: msg.ChatType,
@@ -315,44 +216,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	feishuCtx := protocol.FeishuContext{
 		MessageID: msg.MessageID,
 		ChatID:    msg.ChatID,
-		AppID:     binding.AppID,
+		AppID:     appID,
 	}
 
-	// Acknowledge Feishu immediately (Feishu requires response within 3s)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_, _ = w.Write([]byte("{}"))
-
-	// 8. Asynchronous Dispatch to Hub Router
+	// Asynchronous dispatch to Hub router
 	if h.cfg.Dispatch != nil {
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			dispatchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			res, err := h.cfg.Dispatch(ctx, memberID, asker, queryText, feishuCtx)
+			res, err := h.cfg.Dispatch(dispatchCtx, targetMemberID, asker, queryText, feishuCtx)
 			if err != nil {
-				h.logger.Error("Feishu dispatch failed", "err", err, "member_id", memberID)
+				h.logger.Error("Feishu dispatch failed", "err", err, "member_id", targetMemberID)
 				return
 			}
 
-			// If target is offline and query was queued, send offline acknowledgment (F40)
-			if res != nil && res.Status == protocol.QueryStatusQueued {
+			// If target is offline and query was queued, send offline acknowledgment
+			if res != nil && res.Status == protocol.QueryStatusQueued && binding != nil {
 				targetName := res.TargetMemberName
 				if targetName == "" {
-					targetName = memberID
+					targetName = targetMemberID
 				}
 				ackText := fmt.Sprintf("[TalkIntent 提示]\n%s 目前离线，您的提问已加入排队队列，将在其上线后自动处理。", targetName)
 				client := h.GetClient(binding)
 				if client != nil {
-					if err := client.ReplyMessage(ctx, msg.MessageID, ackText); err != nil {
+					if err := client.ReplyMessage(dispatchCtx, msg.MessageID, ackText); err != nil {
 						h.logger.Warn("Failed to send offline ack reply", "err", err, "msg_id", msg.MessageID)
 					}
 				}
 			}
 		}()
 	}
+
+	return nil
 }
 
-// OnQueryComplete is the async completion hook called by the Hub when a query reaches a terminal state (F40).
+// OnQueryComplete is the async completion hook called by the Hub when a query reaches a terminal state.
 // Replies back to the original Feishu message with the answer or failure notice.
 func (h *Handler) OnQueryComplete(ctx context.Context, q *protocol.QueryDetailResponse) error {
 	if q == nil || q.FeishuContext == nil || q.FeishuContext.MessageID == "" {

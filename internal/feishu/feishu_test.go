@@ -2,7 +2,6 @@ package feishu
 
 import (
 	"context"
-	"crypto/sha256"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -10,192 +9,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestVerifySignature(t *testing.T) {
-	timestamp := "1726828800"
-	nonce := "random_nonce_123"
-	encryptKey := "test_encrypt_key_32bytes_sample!"
-	body := []byte(`{"test":"payload"}`)
-
-	sig := CalculateSignature(timestamp, nonce, encryptKey, body)
-	if len(sig) != 64 {
-		t.Fatalf("expected 64 hex chars, got %d", len(sig))
-	}
-
-	// Valid signature
-	if !VerifySignature(timestamp, nonce, encryptKey, body, sig) {
-		t.Errorf("expected signature to verify successfully")
-	}
-
-	// Tampered nonce
-	if VerifySignature(timestamp, "tampered_nonce", encryptKey, body, sig) {
-		t.Errorf("tampered nonce should fail signature verification")
-	}
-
-	// Tampered timestamp
-	if VerifySignature("1726828801", nonce, encryptKey, body, sig) {
-		t.Errorf("tampered timestamp should fail signature verification")
-	}
-
-	// Tampered body
-	if VerifySignature(timestamp, nonce, encryptKey, []byte(`{"test":"tampered"}`), sig) {
-		t.Errorf("tampered body should fail signature verification")
-	}
-
-	// Wrong key
-	if VerifySignature(timestamp, nonce, "wrong_key", body, sig) {
-		t.Errorf("wrong key should fail signature verification")
-	}
-
-	// Wrong length signature
-	if VerifySignature(timestamp, nonce, encryptKey, body, "short_sig") {
-		t.Errorf("short signature should fail verification")
-	}
-}
-
-func TestVerifyTimestampFreshness(t *testing.T) {
-	now := time.Now().Unix()
-
-	// Current time: valid
-	if !VerifyTimestampFreshness(strconv.FormatInt(now, 10), 300) {
-		t.Errorf("expected current timestamp to be fresh")
-	}
-
-	// 100 seconds ago: valid within 300s window
-	if !VerifyTimestampFreshness(strconv.FormatInt(now-100, 10), 300) {
-		t.Errorf("expected timestamp 100s ago to be fresh")
-	}
-
-	// 301 seconds ago: expired
-	if VerifyTimestampFreshness(strconv.FormatInt(now-301, 10), 300) {
-		t.Errorf("expected timestamp 301s ago to be expired")
-	}
-
-	// 30 seconds into the future (clock skew): allowed up to 60s
-	if !VerifyTimestampFreshness(strconv.FormatInt(now+30, 10), 300) {
-		t.Errorf("expected timestamp 30s in future to be accepted")
-	}
-
-	// 65 seconds into the future: rejected
-	if VerifyTimestampFreshness(strconv.FormatInt(now+65, 10), 300) {
-		t.Errorf("expected timestamp 65s in future to be rejected")
-	}
-
-	// Millisecond timestamp support (13 digits)
-	nowMilli := time.Now().UnixMilli()
-	if !VerifyTimestampFreshness(strconv.FormatInt(nowMilli, 10), 300) {
-		t.Errorf("expected millisecond timestamp to be accepted")
-	}
-
-	// Malformed timestamp string
-	if VerifyTimestampFreshness("not-a-number", 300) {
-		t.Errorf("expected invalid timestamp string to be rejected")
-	}
-}
-
-func TestEncryptAndDecryptPayload(t *testing.T) {
-	encryptKey := "my_super_secret_feishu_key_123!"
-
-	tests := []struct {
-		name  string
-		plain string
-	}{
-		{"empty string", ""},
-		{"short message", "hello world"},
-		{"exact 16 bytes", "1234567890123456"},
-		{"exact 32 bytes", "12345678901234561234567890123456"},
-		{"json event", `{"challenge":"xyz123","token":"tok_abc","type":"url_verification"}`},
-		{"chinese characters", "张三正在重构登录模块，目前进度约80%"},
-		{"large payload", strings.Repeat("TalkIntent probe agent sandbox testing; ", 100)},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			encrypted, err := EncryptPayload([]byte(tc.plain), encryptKey)
-			if err != nil {
-				t.Fatalf("EncryptPayload failed: %v", err)
-			}
-			if encrypted == "" {
-				t.Fatalf("encrypted string should not be empty")
-			}
-
-			decrypted, err := DecryptPayload(encrypted, encryptKey)
-			if err != nil {
-				t.Fatalf("DecryptPayload failed: %v", err)
-			}
-			if string(decrypted) != tc.plain {
-				t.Fatalf("decrypted text mismatch: got %q, want %q", string(decrypted), tc.plain)
-			}
-		})
-	}
-}
-
-func TestDecryptPayloadErrors(t *testing.T) {
-	encryptKey := "valid_test_key_12345"
-
-	// Empty key
-	if _, err := EncryptPayload([]byte("hello"), ""); err == nil {
-		t.Errorf("expected error with empty encryptKey in EncryptPayload")
-	}
-	if _, err := DecryptPayload("abc", ""); err == nil {
-		t.Errorf("expected error with empty encryptKey in DecryptPayload")
-	}
-
-	// Invalid base64
-	if _, err := DecryptPayload("not_base64!@#$", encryptKey); err == nil {
-		t.Errorf("expected error on invalid base64")
-	}
-
-	// Ciphertext too short (< 16 bytes)
-	if _, err := DecryptPayload("AAAA", encryptKey); err == nil {
-		t.Errorf("expected error on ciphertext too short")
-	}
-
-	// Ciphertext not multiple of block size (16 bytes)
-	// 20 bytes in base64:
-	b20 := "AAAAAAAAAAAAAAAAAAAAAAAAAAA="
-	if _, err := DecryptPayload(b20, encryptKey); err == nil {
-		t.Errorf("expected error on ciphertext not multiple of block size")
-	}
-
-	// Decrypt with wrong key should fail padding verification
-	enc, err := EncryptPayload([]byte("test payload for wrong key"), encryptKey)
-	if err != nil {
-		t.Fatalf("EncryptPayload failed: %v", err)
-	}
-	if _, err := DecryptPayload(enc, "wrong_encrypt_key_9999"); err == nil {
-		t.Errorf("expected decryption to fail with wrong key")
-	}
-}
-
-func TestDecryptPayloadIVSpecificationF31(t *testing.T) {
-	// Verify that DecryptPayload adheres to F31:
-	// IV is the first 16 bytes of SHA-256(encryptKey), NOT sliced from ciphertext.
-	encryptKey := "feishu_compliance_key_test"
-	plain := []byte("feishu F31 verification test payload")
-
-	encrypted, err := EncryptPayload(plain, encryptKey)
-	if err != nil {
-		t.Fatalf("EncryptPayload failed: %v", err)
-	}
-
-	keyHash := sha256.Sum256([]byte(encryptKey))
-	expectedIV := keyHash[:16]
-
-	// Decrypt and ensure plain matches
-	decrypted, err := DecryptPayload(encrypted, encryptKey)
-	if err != nil {
-		t.Fatalf("DecryptPayload failed: %v", err)
-	}
-	if string(decrypted) != string(plain) {
-		t.Fatalf("decrypted mismatch: got %q, want %q", string(decrypted), string(plain))
-	}
-
-	// Ensure IV is indeed 16 bytes
-	if len(expectedIV) != 16 {
-		t.Fatalf("expected 16 byte IV, got %d", len(expectedIV))
-	}
-}
 
 func TestStripMentions(t *testing.T) {
 	tests := []struct {
@@ -383,7 +196,6 @@ func TestClientWithFakeServer(t *testing.T) {
 }
 
 func TestClientTokenRefreshRetryOn400(t *testing.T) {
-	// DESIGN.md §6: In case of 400 invalid token, evicts cache and re-fetches
 	fake := NewFakeServer()
 	defer fake.Close()
 

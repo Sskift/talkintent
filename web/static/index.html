@@ -275,26 +275,48 @@
       <div class="card-header">
         <div>
           <h2 class="card-title">个人专属飞书 Bot 凭据绑定</h2>
-          <div class="card-subtitle">配置您在飞书开放平台创建的自建应用，其他人可通过飞书向您的专属 Bot 提问。凭据采用 AES-GCM 安全加密存储。</div>
+          <div class="card-subtitle">配置您在飞书开放平台创建的自建应用，其他人可通过飞书向您的专属 Bot 提问。通过飞书长连接实时接收事件，无需公网地址或反向代理。凭据采用 AES-GCM 安全加密存储。</div>
         </div>
         <button class="btn btn-sm btn-secondary" id="btn-refresh-feishu" onclick="loadFeishuBinding()">刷新状态</button>
+      </div>
+
+      <!-- Feishu Setup Guide Card -->
+      <div id="fs-guide-card" style="margin-bottom: 24px; padding: 18px; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: var(--radius);">
+        <div style="font-weight: 600; font-size: 14px; margin-bottom: 12px; color: var(--primary);">飞书自建应用长连接配置步骤指南</div>
+        <ol style="margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.8; color: var(--text);">
+          <li><strong>创建自建应用</strong>：访问 <a href="https://open.feishu.cn" target="_blank" style="color: var(--primary);">飞书开放平台 (open.feishu.cn)</a>，点击「创建自建应用」。</li>
+          <li><strong>添加机器人能力</strong>：在应用详情页点击「添加应用能力」-「机器人」，开启机器人能力。</li>
+          <li><strong>配置权限范围</strong>：在「开发配置」-「权限管理」中添加以下权限：
+            <div style="margin: 4px 0 6px 0; font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);">
+              • <code>im:message</code> (获取与发送单聊、群消息)<br>
+              • <code>im:message.p2p_msg:readonly</code> (读取用户发给机器人的单聊消息)<br>
+              • <code>im:message:send_as_bot</code> (以应用身份发送消息)
+            </div>
+          </li>
+          <li><strong>添加事件订阅</strong>：在「开发配置」-「事件与回调」中添加事件 <code>im.message.receive_v1</code> (接收消息 v2.0)。</li>
+          <li><strong>切换长连接模式</strong>：在「事件与回调」模式中选择<strong>「使用长连接接收事件 (WebSocket)」</strong>。<br>
+            <div style="margin-top: 4px; padding: 8px 12px; background: rgba(234, 179, 8, 0.1); border-left: 3px solid #eab308; font-size: 12px; color: var(--text-muted); line-height: 1.5;">
+              <strong style="color: #eab308;">重要操作顺序提示：</strong>部分飞书租户配置要求客户端必须先发起长连接握手，飞书控制台才允许保存长连接模式。请<strong>先在下方填入 App ID &amp; App Secret 并点击「保存飞书配置」</strong>，等待上方状态变为「已连接」后，再去飞书控制台保存长连接模式！
+            </div>
+          </li>
+          <li><strong>发布应用版本</strong>：在「应用发布」-「版本管理与发布」中创建并发布版本，企业管理员免审或审核通过后，团队成员即可在飞书向该 Bot 提问。</li>
+        </ol>
       </div>
 
       <!-- Bound Status Card -->
       <div id="fs-bound-card" style="margin-bottom: 24px; padding: 16px; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius); display: none;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
           <div style="display: flex; align-items: center; gap: 8px;">
-            <span class="badge badge-success" id="fs-status-badge">已绑定飞书应用</span>
+            <span class="badge badge-success" id="fs-status-badge">已连接</span>
+            <span id="fs-connected-at" style="font-size: 13px; color: var(--text-muted);"></span>
+            <span id="fs-reconnects" style="font-size: 13px; color: var(--text-muted);"></span>
+            <span id="fs-bound-app-id" style="font-size: 13px; color: var(--text-muted);"></span>
           </div>
           <button class="btn btn-sm btn-danger" id="fs-delete-btn" onclick="deleteFeishuBinding()">解绑 / 删除配置</button>
         </div>
-        <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 6px;">飞书开放平台事件订阅请求网址 (Webhook URL):</div>
-        <div class="copy-box">
-          <input type="text" id="fs-webhook-url" readonly>
-          <button class="btn btn-sm btn-primary" id="fs-copy-webhook-btn" onclick="copyText('', 'fs-copy-webhook-btn')">复制 URL</button>
-        </div>
+        <div id="fs-error-msg" style="display: none; font-size: 13px; color: var(--danger); margin-bottom: 8px;"></div>
         <div style="font-size: 12px; color: var(--text-subtle); margin-top: 8px;">
-          请在飞书开放平台「事件订阅」中填入上述请求网址，并添加事件 <code>im.message.receive_v1</code> (接收消息 v2.0)。
+          提示：请在飞书开放平台「事件与回调」配置中选择「使用长连接接收事件」，并添加事件 <code>im.message.receive_v1</code> (接收消息 v2.0)。无需配置公网回调地址。
         </div>
       </div>
 
@@ -306,17 +328,7 @@
       <div class="form-group">
         <label for="fs-app-secret">App Secret <span class="required">*</span></label>
         <input type="password" id="fs-app-secret" placeholder="••••••••••••••••">
-        <div class="input-hint">用于换取 tenant_access_token 以回复私聊消息</div>
-      </div>
-      <div class="form-group">
-        <label for="fs-token">Verification Token <span class="required">*</span></label>
-        <input type="text" id="fs-token" placeholder="v_xxxxxxxxxxxx">
-        <div class="input-hint">事件订阅验证 Token</div>
-      </div>
-      <div class="form-group">
-        <label for="fs-encrypt-key">Encrypt Key (可选)</label>
-        <input type="password" id="fs-encrypt-key" placeholder="若开启了事件加密则必填">
-        <div class="input-hint">用于解密挑战和回调消息 payload</div>
+        <div class="input-hint">用于建立长连接与换取 tenant_access_token 以回复私聊消息</div>
       </div>
 
       <button class="btn btn-primary" id="fs-save-btn" onclick="saveFeishuBinding()">保存飞书配置</button>

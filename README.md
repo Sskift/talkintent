@@ -31,7 +31,8 @@ The Hub coordinates member discovery, message routing, offline queues, and audit
 ```bash
 talkintent hub --addr :8080 --data-dir ./data
 ```
-- If `TALKINTENT_ADMIN_TOKEN` is not set, TalkIntent automatically generates a secure 32-byte admin token and saves it to `./data/admin.token` (permissions `0600`).
+- **Configuration Precedence**: Explicit CLI flags override environment variables (`TALKINTENT_HUB_ADDR`, `TALKINTENT_DATA_DIR`, `TALKINTENT_ADMIN_TOKEN`, `TALKINTENT_PUBLIC_URL`, `TALKINTENT_HEARTBEAT_INTERVAL`, `TALKINTENT_DEFAULT_QUERY_TTL`, `TALKINTENT_MAX_QUERY_TTL`, `TALKINTENT_MAX_PROBE_TIMEOUT`, `TALKINTENT_RATE_LIMIT_QPM`, `TALKINTENT_RATE_LIMIT_BURST`), which in turn override flag defaults.
+- **Admin Token Resolution Hierarchy**: Explicit CLI flag (`--admin-token`) > Environment variable (`TALKINTENT_ADMIN_TOKEN`) > `./data/admin.token` > Auto-generated 32-byte secure token (saved to `<data-dir>/admin.token` with permissions `0600`).
 
 #### B. Generate Onboarding Invite Codes
 Generate a single-use invite code for a team member:
@@ -152,10 +153,11 @@ Now within Claude Code, simply use:
 ```
 
 #### C. Feishu (Lark) Bot Integration
-1. Open the Web UI via `talkintent web --open`.
-2. Navigate to **Feishu Binding** and enter your bot's `app_id`, `app_secret`, `verification_token`, and `encrypt_key`.
-3. Set your Feishu Event Subscription Webhook URL to `http://<hub-ip>:8080/api/v1/feishu/webhook/<member_id>`.
-4. Send a private message to the bot on Feishu:
+1. Open the Web UI via `talkintent web --open` (or browse to `http://<hub-addr>:8080/web`).
+2. Navigate to **飞书 Bot 绑定** and enter your bot's `App ID` and `App Secret` (optional `Base URL`, defaults to `https://open.feishu.cn`).
+3. Click **保存飞书配置** and confirm the status badge turns to **已连接 (长连接)**. The Hub establishes an outbound WebSocket long connection to Feishu (no public IP, domain, webhook URL, or inbound tunnel required).
+4. In Feishu Open Platform console, go to **事件与回调** and set subscription mode to **使用长连接接收事件 (WebSocket)**, add the `im.message.receive_v1` event, and publish an app version.
+5. Send a private message to the bot on Feishu:
    > *"现在登录模块进展如何？"*  
    The bot automatically replies in thread when the probe completes.
 

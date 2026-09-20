@@ -3,18 +3,11 @@ package feishu
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -252,123 +245,4 @@ func (c *Client) doPostWithTokenRetry(ctx context.Context, url string, payload a
 	}
 
 	return errors.New("request failed after token refresh retry")
-}
-
-// CalculateSignature computes the Feishu signature:
-// SHA256(timestamp + nonce + encryptKey + rawBody)
-func CalculateSignature(timestamp, nonce, encryptKey string, rawBody []byte) string {
-	h := sha256.New()
-	h.Write([]byte(timestamp))
-	h.Write([]byte(nonce))
-	h.Write([]byte(encryptKey))
-	h.Write(rawBody)
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-// VerifySignature validates the Feishu signature against timestamp, nonce, key, and raw body
-// using constant-time comparison (F12).
-func VerifySignature(timestamp, nonce, encryptKey string, rawBody []byte, expectedSig string) bool {
-	calculated := CalculateSignature(timestamp, nonce, encryptKey, rawBody)
-	if len(calculated) != len(expectedSig) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(calculated), []byte(expectedSig)) == 1
-}
-
-// VerifyTimestampFreshness checks if a timestamp is within maxAgeSeconds (default: 300s) of now (F12).
-// Accepts both seconds (10 digits) and milliseconds (13 digits).
-func VerifyTimestampFreshness(timestampStr string, maxAgeSeconds int64) bool {
-	if maxAgeSeconds <= 0 {
-		maxAgeSeconds = 300
-	}
-	ts, err := strconv.ParseInt(timestampStr, 10, 64)
-	if err != nil {
-		return false
-	}
-	// Defensively handle millisecond timestamps
-	if ts > 1e11 {
-		ts = ts / 1000
-	}
-	now := time.Now().Unix()
-	diff := now - ts
-	if diff < -60 || diff > maxAgeSeconds {
-		return false
-	}
-	return true
-}
-
-// EncryptPayload encrypts plaintext using AES-256-CBC according to Feishu specification:
-// Key is SHA-256(encryptKey), IV is the first 16 bytes of keyHash, PKCS#7 padded, base64 encoded.
-func EncryptPayload(plain []byte, encryptKey string) (string, error) {
-	if encryptKey == "" {
-		return "", errors.New("encryptKey cannot be empty")
-	}
-
-	keyHash := sha256.Sum256([]byte(encryptKey))
-	block, err := aes.NewCipher(keyHash[:])
-	if err != nil {
-		return "", fmt.Errorf("create cipher failed: %w", err)
-	}
-
-	blockSize := aes.BlockSize
-	paddingLen := blockSize - (len(plain) % blockSize)
-	padText := bytes.Repeat([]byte{byte(paddingLen)}, paddingLen)
-	padded := append(plain, padText...)
-
-	iv := keyHash[:blockSize]
-	mode := cipher.NewCBCEncrypter(block, iv)
-	ciphertext := make([]byte, len(padded))
-	mode.CryptBlocks(ciphertext, padded)
-
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
-}
-
-// DecryptPayload decrypts AES-CBC-256 payload according to Feishu specification (F31):
-// IV is the first 16 bytes of SHA-256(encryptKey), and encryptedBase64 is pure ciphertext.
-func DecryptPayload(encryptedBase64, encryptKey string) ([]byte, error) {
-	if encryptKey == "" {
-		return nil, errors.New("encryptKey cannot be empty")
-	}
-
-	cipherData, err := base64.StdEncoding.DecodeString(encryptedBase64)
-	if err != nil {
-		return nil, fmt.Errorf("base64 decode failed: %w", err)
-	}
-
-	keyHash := sha256.Sum256([]byte(encryptKey))
-	block, err := aes.NewCipher(keyHash[:])
-	if err != nil {
-		return nil, fmt.Errorf("create cipher failed: %w", err)
-	}
-
-	if len(cipherData) < aes.BlockSize {
-		return nil, errors.New("ciphertext too short")
-	}
-
-	if len(cipherData)%aes.BlockSize != 0 {
-		return nil, errors.New("ciphertext is not a multiple of the block size")
-	}
-
-	iv := keyHash[:aes.BlockSize]
-
-	mode := cipher.NewCBCDecrypter(block, iv)
-	plain := make([]byte, len(cipherData))
-	mode.CryptBlocks(plain, cipherData)
-
-	// PKCS#7 unpadding with strict byte verification
-	length := len(plain)
-	if length == 0 {
-		return nil, errors.New("empty plain text")
-	}
-	padding := int(plain[length-1])
-	if padding < 1 || padding > aes.BlockSize || padding > length {
-		return nil, errors.New("invalid padding")
-	}
-	for i := 0; i < padding; i++ {
-		if plain[length-1-i] != byte(padding) {
-			return nil, errors.New("invalid padding bytes")
-		}
-	}
-
-	return plain[:length-padding], nil
 }

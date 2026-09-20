@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Environment variable constants for TalkIntent client and hub overrides.
@@ -127,9 +129,9 @@ func (c *ClientConfig) ApplyEnvOverrides() {
 }
 
 // ApplyEnvOverrides overrides HubConfig fields from environment variables.
-func (c *HubConfig) ApplyEnvOverrides() {
+func (c *HubConfig) ApplyEnvOverrides() error {
 	if c == nil {
-		return
+		return nil
 	}
 
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentHubAddr)); v != "" {
@@ -145,37 +147,78 @@ func (c *HubConfig) ApplyEnvOverrides() {
 		c.PublicURL = v
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentHeartbeat)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			c.HeartbeatIntervalSec = n
+		n, err := parseDurationOrPositiveSeconds(v, EnvTalkIntentHeartbeat)
+		if err != nil {
+			return err
 		}
+		c.HeartbeatIntervalSec = n
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentDefaultQueryTTL)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			c.DefaultQueryTTLSec = n
+		n, err := parseDurationOrPositiveSeconds(v, EnvTalkIntentDefaultQueryTTL)
+		if err != nil {
+			return err
 		}
+		c.DefaultQueryTTLSec = n
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentMaxQueryTTL)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			c.MaxQueryTTLSec = n
+		n, err := parseDurationOrPositiveSeconds(v, EnvTalkIntentMaxQueryTTL)
+		if err != nil {
+			return err
 		}
+		c.MaxQueryTTLSec = n
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentMaxProbeTimeout)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			c.MaxProbeTimeoutSec = n
+		n, err := parseDurationOrPositiveSeconds(v, EnvTalkIntentMaxProbeTimeout)
+		if err != nil {
+			return err
 		}
+		c.MaxProbeTimeoutSec = n
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentRateLimitQPM)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			c.RateLimits.QueriesPerMinute = n
-			c.RateLimit.QueriesPerMinute = n
+		n, err := parsePositiveInt(v, EnvTalkIntentRateLimitQPM)
+		if err != nil {
+			return err
 		}
+		c.RateLimits.QueriesPerMinute = n
+		c.RateLimit.QueriesPerMinute = n
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentRateLimitBurst)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			c.RateLimits.Burst = n
-			c.RateLimit.Burst = n
+		n, err := parsePositiveInt(v, EnvTalkIntentRateLimitBurst)
+		if err != nil {
+			return err
 		}
+		c.RateLimits.Burst = n
+		c.RateLimit.Burst = n
 	}
+	return nil
+}
+
+func parseDurationOrPositiveSeconds(s, envVar string) (int, error) {
+	if n, err := strconv.Atoi(s); err == nil {
+		if n <= 0 {
+			return 0, fmt.Errorf("invalid %s value %q: must be positive", envVar, s)
+		}
+		return n, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		sec := int(d.Seconds())
+		if sec <= 0 {
+			return 0, fmt.Errorf("invalid %s value %q: must be positive", envVar, s)
+		}
+		return sec, nil
+	}
+	return 0, fmt.Errorf("invalid %s value %q: must be a positive integer or duration (e.g. 60 or 60s)", envVar, s)
+}
+
+func parsePositiveInt(s, envVar string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s value %q: must be a positive integer", envVar, s)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid %s value %q: must be positive", envVar, s)
+	}
+	return n, nil
 }
 
 // parseBool interprets common truthy string values ("true", "1", "yes", "on").

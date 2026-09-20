@@ -141,15 +141,17 @@ type AuditListResponse struct {
 
 // FeishuBindingRequest contains credentials for a member's Feishu bot.
 type FeishuBindingRequest struct {
-	AppID             string `json:"app_id"`
-	AppSecret         string `json:"app_secret"`
-	VerificationToken string `json:"verification_token"`
-	EncryptKey        string `json:"encrypt_key"`
+	AppID     string `json:"app_id"`
+	AppSecret string `json:"app_secret"`
+	BaseURL   string `json:"base_url,omitempty"`
 }
 
 // FeishuBindingResponse contains the configured Feishu bot status.
 type FeishuBindingResponse struct {
-	Bound      bool   `json:"bound"`
-	AppID      string `json:"app_id,omitempty"`
-	WebhookURL string `json:"webhook_url,omitempty"`
+	Bound       bool   `json:"bound"`
+	AppID       string `json:"app_id,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
+	ConnectedAt string `json:"connected_at,omitempty"`
+	Reconnects  int    `json:"reconnects"`
 }

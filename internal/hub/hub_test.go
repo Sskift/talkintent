@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/Sskift/talkintent/internal/config"
+	"github.com/Sskift/talkintent/internal/feishu"
 	"github.com/Sskift/talkintent/internal/protocol"
 	"github.com/Sskift/talkintent/internal/store"
 	"github.com/Sskift/talkintent/web"
@@ -27,7 +28,7 @@ func setupTestHub(t *testing.T) (*HubServer, store.Store, string, func()) {
 	}
 
 	cfg := &config.HubConfig{
-		Addr:    ":0",
+		Addr:    "127.0.0.1:0", // loopback only: a 0.0.0.0 bind trips the Windows Defender prompt on every fresh test binary
 		DataDir: tempDir,
 		RateLimits: config.RateLimitConfig{
 			QueriesPerMinute: 60,
@@ -610,7 +611,7 @@ func TestRateLimiting(t *testing.T) {
 
 	// Hub with tight rate limit: 2 QPM, burst 2
 	cfg := &config.HubConfig{
-		Addr:    ":0",
+		Addr:    "127.0.0.1:0",
 		DataDir: tempDir,
 		RateLimits: config.RateLimitConfig{
 			QueriesPerMinute: 2,
@@ -855,11 +856,13 @@ func TestFeishuBindingCRUD(t *testing.T) {
 	}
 
 	// 2. POST /api/v1/feishu/binding -> save binding
+	fakeServer := feishu.NewFakeServer()
+	defer fakeServer.Close()
+
 	bindReq := protocol.FeishuBindingRequest{
-		AppID:             "cli_test_12345",
-		AppSecret:         "sec_test_67890",
-		VerificationToken: "token_abc",
-		EncryptKey:        "enc_key_def",
+		AppID:     "cli_test_12345",
+		AppSecret: "sec_test_67890",
+		BaseURL:   fakeServer.URL(),
 	}
 	bindBytes, _ := json.Marshal(bindReq)
 	reqPost := httptest.NewRequest("POST", "/api/v1/feishu/binding", bytes.NewReader(bindBytes))
@@ -1057,7 +1060,7 @@ func TestWebUIMounting(t *testing.T) {
 	defer st.Close()
 
 	cfg := &config.HubConfig{
-		Addr:    ":0",
+		Addr:    "127.0.0.1:0",
 		DataDir: tempDir,
 	}
 
@@ -1105,8 +1108,8 @@ func TestWebUIMounting(t *testing.T) {
 	}
 }
 
-// TestFeishuWebhookRouting verifies that Hub routes Feishu webhook challenges to feishuHandler.
-func TestFeishuWebhookRouting(t *testing.T) {
+// TestFeishuBindingLongConnection verifies that Hub starts a long-connection client when a Feishu binding is saved.
+func TestFeishuBindingLongConnection(t *testing.T) {
 	srv, st, _, cleanup := setupTestHub(t)
 	defer cleanup()
 
@@ -1114,30 +1117,62 @@ func TestFeishuWebhookRouting(t *testing.T) {
 	inv, _ := st.CreateInvite(ctx, &protocol.InviteCreateRequest{TargetName: "FeishuUser"})
 	pair, _ := st.ConsumeInvite(ctx, &protocol.PairRequest{InviteCode: inv.Code, MachineName: "dev-fs"})
 
-	// Save Feishu binding
-	_ = st.SaveFeishuBinding(ctx, pair.MemberID, &protocol.FeishuBindingRequest{
-		AppID:             "cli_test_hook",
-		AppSecret:         "secret_12345",
-		VerificationToken: "vtoken_12345",
-	})
+	fakeServer := feishu.NewFakeServer()
+	defer fakeServer.Close()
 
-	// Webhook url_verification challenge
-	body := `{"type":"url_verification","challenge":"challenge_token_abc","token":"vtoken_12345"}`
-	req := httptest.NewRequest("POST", "/api/v1/feishu/webhook/"+pair.MemberID, strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
+	// POST /api/v1/feishu/binding pointing to fakeServer
+	bindReq := protocol.FeishuBindingRequest{
+		AppID:     "cli_test_hook",
+		AppSecret: "secret_12345",
+		BaseURL:   fakeServer.URL(),
+	}
+	bindBytes, _ := json.Marshal(bindReq)
+	reqPost := httptest.NewRequest("POST", "/api/v1/feishu/binding", bytes.NewReader(bindBytes))
+	reqPost.Header.Set("Authorization", "Bearer "+pair.Token)
+	recPost := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recPost, reqPost)
 
-	srv.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for feishu webhook challenge, got %d: %s", rec.Code, rec.Body.String())
+	if recPost.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK saving binding, got %d: %s", recPost.Code, recPost.Body.String())
 	}
 
-	var resp map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode webhook response: %v", err)
+	// Wait for WebSocket client to connect to fakeServer
+	if !fakeServer.WaitForWSConnection(5 * time.Second) {
+		t.Fatalf("timed out waiting for Feishu long-connection client to connect")
 	}
-	if resp["challenge"] != "challenge_token_abc" {
-		t.Errorf("expected challenge token challenge_token_abc, got %s", resp["challenge"])
+
+	// Verify GET /api/v1/feishu/binding returns connected status
+	var bindResp protocol.FeishuBindingResponse
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		reqGet := httptest.NewRequest("GET", "/api/v1/feishu/binding", nil)
+		reqGet.Header.Set("Authorization", "Bearer "+pair.Token)
+		recGet := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(recGet, reqGet)
+
+		if recGet.Code == http.StatusOK {
+			var resp protocol.FeishuBindingResponse
+			if err := json.NewDecoder(recGet.Body).Decode(&resp); err == nil {
+				bindResp = resp
+				if resp.Status == "connected" {
+					break
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !bindResp.Bound || bindResp.AppID != "cli_test_hook" {
+		t.Errorf("unexpected binding response: %+v", bindResp)
+	}
+	if bindResp.Status != "connected" {
+		t.Errorf("expected binding status 'connected', got %q", bindResp.Status)
+	}
+	if bindResp.ConnectedAt == "" {
+		t.Errorf("expected connected_at to be populated, got empty string")
+	}
+	if bindResp.Reconnects != 0 {
+		t.Errorf("expected reconnects to be 0 for fresh connection, got %d", bindResp.Reconnects)
 	}
 }
 

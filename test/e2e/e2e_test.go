@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -714,11 +713,11 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 	})
 
 	// =========================================================================
-	// Scenario (f): Feishu integration: fake Feishu server posts signed+encrypted
-	//                im.message.receive_v1 to Bob's webhook -> daemon answers ->
+	// Scenario (f): Feishu integration: fake Feishu server connects via long connection,
+	//                pushes im.message.receive_v1 to Bob's bot -> daemon answers ->
 	//                fake server records the reply text.
 	// =========================================================================
-	t.Run("ScenarioF_FeishuWebhook_SignedEncryptedReply", func(t *testing.T) {
+	t.Run("ScenarioF_FeishuLongConnection_Reply", func(t *testing.T) {
 		mockServer.Reset()
 
 		// Set up Fake Feishu Open Platform Server
@@ -740,13 +739,11 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 			http.DefaultTransport = origTransport
 		}()
 
-		// Save Feishu bot binding for Bob
-		encryptKey := "12345678901234567890123456789012"
+		// Save Feishu bot binding for Bob with BaseURL pointing to fake server
 		bindingReq := protocol.FeishuBindingRequest{
-			AppID:             "cli_mock_bob_app",
-			AppSecret:         "sec_mock_bob_secret",
-			VerificationToken: "ver_mock_bob_token",
-			EncryptKey:        encryptKey,
+			AppID:     "cli_mock_bob_app",
+			AppSecret: "sec_mock_bob_secret",
+			BaseURL:   fakeFeishu.URL(),
 		}
 		b, _ := json.Marshal(bindingReq)
 		bindHTTPReq, err := http.NewRequestWithContext(ctx, "POST", hubURL+"/api/v1/feishu/binding", bytes.NewReader(b))
@@ -767,43 +764,32 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 			t.Fatalf("save binding returned HTTP %d: %s", bindResp.StatusCode, string(body))
 		}
 
-		// Build encrypted Feishu im.message.receive_v1 event payload
-		eventBody, err := fakeFeishu.BuildEncryptedMessageReceiveEvent(
+		// Wait for Bob's WSClient to connect to fakeFeishu long connection
+		if err := fakeFeishu.WaitForConnection(5 * time.Second); err != nil {
+			t.Fatalf("feishu long connection did not connect: %v", err)
+		}
+		bobWSClient := hubServer.FeishuClientForTest(bobID)
+		if bobWSClient == nil {
+			t.Fatal("expected non-nil Feishu client for Bob")
+		}
+
+		// Push message event over WebSocket
+		respFrame, err := fakeFeishu.PushMessageEvent(
+			ctx,
 			"evt_feishu_test_001",
 			"om_feishu_msg_1001",
 			"oc_test_chat_001",
 			"ou_feishu_user_001",
 			"What are you working on right now?",
-			encryptKey,
 		)
 		if err != nil {
-			t.Fatalf("failed to build encrypted feishu event: %v", err)
+			t.Fatalf("failed to push feishu message event: %v", err)
 		}
-
-		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-		nonce := "mock_test_nonce_888"
-		sig := fakeFeishu.SignEvent(timestamp, nonce, encryptKey, eventBody)
-
-		// Post webhook to Bob's endpoint: /api/v1/feishu/webhook/{bob_member_id}
-		webhookURL := fmt.Sprintf("%s/api/v1/feishu/webhook/%s", hubURL, bobID)
-		webhookReq, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(eventBody))
-		if err != nil {
-			t.Fatal(err)
+		if respFrame == nil {
+			t.Fatal("expected response frame from WS client, got nil")
 		}
-		webhookReq.Header.Set("Content-Type", "application/json; charset=utf-8")
-		webhookReq.Header.Set("X-Lark-Request-Timestamp", timestamp)
-		webhookReq.Header.Set("X-Lark-Request-Nonce", nonce)
-		webhookReq.Header.Set("X-Lark-Signature", sig)
-
-		webhookResp, err := httpClient.Do(webhookReq)
-		if err != nil {
-			t.Fatalf("feishu webhook post failed: %v", err)
-		}
-		defer webhookResp.Body.Close()
-
-		if webhookResp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(webhookResp.Body)
-			t.Fatalf("feishu webhook returned HTTP %d: %s", webhookResp.StatusCode, string(body))
+		if respFrame.HeaderValue("biz_rt") == "" {
+			t.Errorf("expected response frame to contain biz_rt header")
 		}
 
 		// Wait for Bob's daemon to answer and Hub to send the reply back to FakeServer
@@ -827,6 +813,82 @@ func TestE2E_FullScenarioSuite(t *testing.T) {
 		}
 		if !strings.Contains(reply.Text, "feature/auth-v2") {
 			t.Errorf("expected Feishu reply text to mention Bob's workspace branch, got: %s", reply.Text)
+		}
+
+		// Assert response frame payload code is 200
+		var respPayloadMap map[string]any
+		if err := json.Unmarshal(respFrame.Payload, &respPayloadMap); err != nil {
+			t.Fatalf("failed to unmarshal response frame payload: %v", err)
+		}
+		if code, ok := respPayloadMap["code"].(float64); !ok || int(code) != 200 {
+			t.Errorf("expected response frame code 200, got %v", respPayloadMap["code"])
+		}
+
+		// Fragmented-event path: fake pushes a shuffled multi-fragment im.message.receive_v1
+		fragRespFrame, err := fakeFeishu.PushFragmentedMessageEvent(
+			ctx,
+			"evt_feishu_test_frag_002",
+			"om_feishu_msg_1002",
+			"oc_test_chat_001",
+			"ou_feishu_user_001",
+			"What branch is your workspace on?",
+			3,
+			[]int{2, 0, 1},
+		)
+		if err != nil {
+			t.Fatalf("failed to push fragmented feishu message event: %v", err)
+		}
+		if fragRespFrame == nil {
+			t.Fatal("expected response frame from fragmented event, got nil")
+		}
+
+		var fragRespPayloadMap map[string]any
+		if err := json.Unmarshal(fragRespFrame.Payload, &fragRespPayloadMap); err != nil {
+			t.Fatalf("failed to unmarshal frag response frame payload: %v", err)
+		}
+		if code, ok := fragRespPayloadMap["code"].(float64); !ok || int(code) != 200 {
+			t.Errorf("expected fragmented response frame code 200, got %v", fragRespPayloadMap["code"])
+		}
+
+		// Wait for reply text to reach the fake REST side
+		fragDeadline := time.Now().Add(10 * time.Second)
+		var fragReply *feishu.RecordedReply
+		for time.Now().Before(fragDeadline) {
+			allReplies := fakeFeishu.Replies()
+			for _, r := range allReplies {
+				if r.MessageID == "om_feishu_msg_1002" {
+					cp := r
+					fragReply = &cp
+					break
+				}
+			}
+			if fragReply != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if fragReply == nil {
+			t.Fatal("expected FakeServer to receive Feishu reply message for fragmented event, got none")
+		}
+		if !strings.Contains(fragReply.Text, "feature/auth-v2") {
+			t.Errorf("expected Feishu reply text to mention Bob's workspace branch, got: %s", fragReply.Text)
+		}
+
+		// After hub Stop assert no Feishu client is left running (status "stopped" observed, and the fake sees the WebSocket closed)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := hubServer.Stop(stopCtx); err != nil {
+			t.Fatalf("hubServer.Stop failed: %v", err)
+		}
+
+		if !fakeFeishu.WaitForWSClose(5 * time.Second) {
+			t.Fatalf("fake Feishu server did not observe WebSocket close after Hub Stop")
+		}
+
+		st, _ := bobWSClient.Status()
+		if st != "stopped" {
+			t.Errorf("expected Bob's Feishu client status 'stopped' after Hub Stop, got %q", st)
 		}
 	})
 }

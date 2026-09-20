@@ -621,7 +621,7 @@ textarea {
   background: var(--primary-subtle);
 }
 
-/* Webhook copy box */
+/* Copy box */
 .copy-box {
   display: flex;
   gap: 8px;

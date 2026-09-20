@@ -1,0 +1,267 @@
+{
+  "sdk_version": "v3.12.0",
+  "vectors": [
+    {
+      "name": "ping_frame",
+      "description": "Ping frame constructed by SDK NewPingFrame(12345) with FrameTypeControl (0) and header type=ping",
+      "decoded": {
+        "seq_id": 0,
+        "log_id": 0,
+        "service": 12345,
+        "method": 0,
+        "headers": {
+          "type": "ping"
+        },
+        "header_list": [
+          {
+            "key": "type",
+            "value": "ping"
+          }
+        ]
+      },
+      "hex_bytes": "0800100018b96020002a0c0a0474797065120470696e6732003a004a00",
+      "byte_length": 29
+    },
+    {
+      "name": "pong_control_frame",
+      "description": "Server Pong control frame with header type=pong and JSON ClientConfig payload",
+      "decoded": {
+        "seq_id": 0,
+        "log_id": 0,
+        "service": 12345,
+        "method": 0,
+        "headers": {
+          "type": "pong"
+        },
+        "header_list": [
+          {
+            "key": "type",
+            "value": "pong"
+          }
+        ],
+        "payload_text": "{\"ReconnectCount\":-1,\"ReconnectInterval\":120,\"ReconnectNonce\":30,\"PingInterval\":120}",
+        "payload_hex": "7b225265636f6e6e656374436f756e74223a2d312c225265636f6e6e656374496e74657276616c223a3132302c225265636f6e6e6563744e6f6e6365223a33302c2250696e67496e74657276616c223a3132307d"
+      },
+      "hex_bytes": "0800100018b96020002a0c0a04747970651204706f6e6732003a0042547b225265636f6e6e656374436f756e74223a2d312c225265636f6e6e656374496e74657276616c223a3132302c225265636f6e6e6563744e6f6e6365223a33302c2250696e67496e74657276616c223a3132307d4a00",
+      "byte_length": 115
+    },
+    {
+      "name": "single_fragment_event",
+      "description": "Single-fragment event data frame (sum=1, seq=0) carrying Feishu v2 event JSON payload",
+      "decoded": {
+        "seq_id": 1001,
+        "log_id": 2001,
+        "service": 12345,
+        "method": 1,
+        "headers": {
+          "message_id": "msg_12345678",
+          "seq": "0",
+          "sum": "1",
+          "timestamp": "1726862400000",
+          "trace_id": "trace_abcdef123456",
+          "type": "event"
+        },
+        "header_list": [
+          {
+            "key": "type",
+            "value": "event"
+          },
+          {
+            "key": "message_id",
+            "value": "msg_12345678"
+          },
+          {
+            "key": "sum",
+            "value": "1"
+          },
+          {
+            "key": "seq",
+            "value": "0"
+          },
+          {
+            "key": "trace_id",
+            "value": "trace_abcdef123456"
+          },
+          {
+            "key": "timestamp",
+            "value": "1726862400000"
+          }
+        ],
+        "payload_text": "{\"schema\":\"2.0\",\"header\":{\"event_id\":\"ev_12345678\",\"token\":\"ver_token_xxx\",\"create_time\":\"1726862400000\",\"event_type\":\"im.message.receive_v1\",\"tenant_key\":\"tenant_123\"},\"event\":{\"message\":{\"message_id\":\"om_123\",\"chat_id\":\"oc_123\",\"content\":\"{\\\"text\\\":\\\"hello\\\"}\",\"message_type\":\"text\"}}}",
+        "payload_hex": "7b22736368656d61223a22322e30222c22686561646572223a7b226576656e745f6964223a2265765f3132333435363738222c22746f6b656e223a227665725f746f6b656e5f787878222c226372656174655f74696d65223a2231373236383632343030303030222c226576656e745f74797065223a22696d2e6d6573736167652e726563656976655f7631222c2274656e616e745f6b6579223a2274656e616e745f313233227d2c226576656e74223a7b226d657373616765223a7b226d6573736167655f6964223a226f6d5f313233222c22636861745f6964223a226f635f313233222c22636f6e74656e74223a227b5c22746578745c223a5c2268656c6c6f5c227d222c226d6573736167655f74797065223a2274657874227d7d7d"
+      },
+      "hex_bytes": "08e90710d10f18b96020012a0d0a047479706512056576656e742a1a0a0a6d6573736167655f6964120c6d73675f31323334353637382a080a0373756d1201312a080a037365711201302a1e0a0874726163655f6964121274726163655f6162636465663132333435362a1a0a0974696d657374616d70120d3137323638363234303030303032003a00429f027b22736368656d61223a22322e30222c22686561646572223a7b226576656e745f6964223a2265765f3132333435363738222c22746f6b656e223a227665725f746f6b656e5f787878222c226372656174655f74696d65223a2231373236383632343030303030222c226576656e745f74797065223a22696d2e6d6573736167652e726563656976655f7631222c2274656e616e745f6b6579223a2274656e616e745f313233227d2c226576656e74223a7b226d657373616765223a7b226d6573736167655f6964223a226f6d5f313233222c22636861745f6964223a226f635f313233222c22636f6e74656e74223a227b5c22746578745c223a5c2268656c6c6f5c227d222c226d6573736167655f74797065223a2274657874227d7d7d4a00",
+      "byte_length": 430
+    },
+    {
+      "name": "multi_part_event_seq0",
+      "description": "First fragment of a 2-part event frame (sum=2, seq=0)",
+      "decoded": {
+        "seq_id": 1002,
+        "log_id": 2002,
+        "service": 12345,
+        "method": 1,
+        "headers": {
+          "message_id": "msg_multipart_999",
+          "seq": "0",
+          "sum": "2",
+          "trace_id": "trace_multi_001",
+          "type": "event"
+        },
+        "header_list": [
+          {
+            "key": "type",
+            "value": "event"
+          },
+          {
+            "key": "message_id",
+            "value": "msg_multipart_999"
+          },
+          {
+            "key": "sum",
+            "value": "2"
+          },
+          {
+            "key": "seq",
+            "value": "0"
+          },
+          {
+            "key": "trace_id",
+            "value": "trace_multi_001"
+          }
+        ],
+        "payload_text": "{\"schema\":\"2.0\",\"header\":{\"event_id\":\"ev_multi_999\",\"event_type\":\"im.message.receive_v1\"},",
+        "payload_hex": "7b22736368656d61223a22322e30222c22686561646572223a7b226576656e745f6964223a2265765f6d756c74695f393939222c226576656e745f74797065223a22696d2e6d6573736167652e726563656976655f7631227d2c"
+      },
+      "hex_bytes": "08ea0710d20f18b96020012a0d0a047479706512056576656e742a1f0a0a6d6573736167655f696412116d73675f6d756c7469706172745f3939392a080a0373756d1201322a080a037365711201302a1b0a0874726163655f6964120f74726163655f6d756c74695f30303132003a00425a7b22736368656d61223a22322e30222c22686561646572223a7b226576656e745f6964223a2265765f6d756c74695f393939222c226576656e745f74797065223a22696d2e6d6573736167652e726563656976655f7631227d2c4a00",
+      "byte_length": 206
+    },
+    {
+      "name": "multi_part_event_seq1",
+      "description": "Second fragment of a 2-part event frame (sum=2, seq=1)",
+      "decoded": {
+        "seq_id": 1003,
+        "log_id": 2003,
+        "service": 12345,
+        "method": 1,
+        "headers": {
+          "message_id": "msg_multipart_999",
+          "seq": "1",
+          "sum": "2",
+          "trace_id": "trace_multi_001",
+          "type": "event"
+        },
+        "header_list": [
+          {
+            "key": "type",
+            "value": "event"
+          },
+          {
+            "key": "message_id",
+            "value": "msg_multipart_999"
+          },
+          {
+            "key": "sum",
+            "value": "2"
+          },
+          {
+            "key": "seq",
+            "value": "1"
+          },
+          {
+            "key": "trace_id",
+            "value": "trace_multi_001"
+          }
+        ],
+        "payload_text": "\"event\":{\"message\":{\"message_id\":\"om_part2\",\"content\":\"{\\\"text\\\":\\\"split payload\\\"}\"}}}",
+        "payload_hex": "226576656e74223a7b226d657373616765223a7b226d6573736167655f6964223a226f6d5f7061727432222c22636f6e74656e74223a227b5c22746578745c223a5c2273706c6974207061796c6f61645c227d227d7d7d"
+      },
+      "hex_bytes": "08eb0710d30f18b96020012a0d0a047479706512056576656e742a1f0a0a6d6573736167655f696412116d73675f6d756c7469706172745f3939392a080a0373756d1201322a080a037365711201312a1b0a0874726163655f6964120f74726163655f6d756c74695f30303132003a004257226576656e74223a7b226d657373616765223a7b226d6573736167655f6964223a226f6d5f7061727432222c22636f6e74656e74223a227b5c22746578745c223a5c2273706c6974207061796c6f61645c227d227d7d7d4a00",
+      "byte_length": 203
+    },
+    {
+      "name": "event_response_success",
+      "description": "Event response frame echoing request SeqID/LogID with biz_rt header and {\"code\":200,\"headers\":null,\"data\":null} payload",
+      "decoded": {
+        "seq_id": 1001,
+        "log_id": 2001,
+        "service": 12345,
+        "method": 1,
+        "headers": {
+          "biz_rt": "42",
+          "message_id": "msg_12345678",
+          "seq": "0",
+          "sum": "1",
+          "timestamp": "1726862400000",
+          "trace_id": "trace_abcdef123456",
+          "type": "event"
+        },
+        "header_list": [
+          {
+            "key": "type",
+            "value": "event"
+          },
+          {
+            "key": "message_id",
+            "value": "msg_12345678"
+          },
+          {
+            "key": "sum",
+            "value": "1"
+          },
+          {
+            "key": "seq",
+            "value": "0"
+          },
+          {
+            "key": "trace_id",
+            "value": "trace_abcdef123456"
+          },
+          {
+            "key": "timestamp",
+            "value": "1726862400000"
+          },
+          {
+            "key": "biz_rt",
+            "value": "42"
+          }
+        ],
+        "payload_text": "{\"code\":200,\"headers\":null,\"data\":null}",
+        "payload_hex": "7b22636f6465223a3230302c2268656164657273223a6e756c6c2c2264617461223a6e756c6c7d"
+      },
+      "hex_bytes": "08e90710d10f18b96020012a0d0a047479706512056576656e742a1a0a0a6d6573736167655f6964120c6d73675f31323334353637382a080a0373756d1201312a080a037365711201302a1e0a0874726163655f6964121274726163655f6162636465663132333435362a1a0a0974696d657374616d70120d313732363836323430303030302a0c0a0662697a5f72741202343232003a0042277b22636f6465223a3230302c2268656164657273223a6e756c6c2c2264617461223a6e756c6c7d4a00",
+      "byte_length": 195
+    },
+    {
+      "name": "frame_with_extensions",
+      "description": "Frame exercising optional protobuf fields: payload_encoding, payload_type, and LogIDNew",
+      "decoded": {
+        "seq_id": 1005,
+        "log_id": 2005,
+        "service": 12345,
+        "method": 1,
+        "headers": {
+          "message_id": "msg_extended_888",
+          "type": "event"
+        },
+        "header_list": [
+          {
+            "key": "type",
+            "value": "event"
+          },
+          {
+            "key": "message_id",
+            "value": "msg_extended_888"
+          }
+        ],
+        "payload_encoding": "gzip",
+        "payload_type": "application/json",
+        "payload_text": "mock_compressed_bytes_here",
+        "payload_hex": "6d6f636b5f636f6d707265737365645f62797465735f68657265",
+        "log_id_new": "log_new_string_888999"
+      },
+      "hex_bytes": "08ed0710d50f18b96020012a0d0a047479706512056576656e742a1e0a0a6d6573736167655f696412106d73675f657874656e6465645f3838383204677a69703a106170706c69636174696f6e2f6a736f6e421a6d6f636b5f636f6d707265737365645f62797465735f686572654a156c6f675f6e65775f737472696e675f383838393939",
+      "byte_length": 133
+    }
+  ]
+}

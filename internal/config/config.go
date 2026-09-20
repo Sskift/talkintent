@@ -397,7 +397,9 @@ func LoadHubConfig(path string) (*HubConfig, error) {
 	}
 	cfg.RateLimit = cfg.RateLimits
 
-	cfg.ApplyEnvOverrides()
+	if err := cfg.ApplyEnvOverrides(); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
 }

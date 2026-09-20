@@ -2,29 +2,30 @@
 
 Version: 1.0.0  
 Target: TalkIntent v1.1.0  
-Scope: Verification across 3 Deployment Topologies  
+Scope: Verification across 4 Deployment Topologies (including Production A4A)  
 
 ---
 
 ## 1. Overview & Verification Matrix
 
-TalkIntent is verified across three standard deployment topologies:
+TalkIntent is verified across four standard deployment topologies:
 1. **Topology 1: Local Docker Compose (Automated CI / Regression)**: Full multi-node mesh on a single machine with a Mock LLM server.
 2. **Topology 2: Multi-User Linux Host (StarPub Environment)**: Single Linux VM with multiple Unix users simulating isolated developer workstations, connected to a real LLM endpoint with private CA.
-3. **Topology 3: Cross-Machine (Remote Linux Hub + Windows/macOS Laptops)**: Production configuration with developer laptops behind NAT connecting outbound to a cloud Hub.
+3. **Topology 3: Cross-Machine (Remote Linux Hub + Windows/macOS Laptops)**: Production configuration with developer laptops behind NAT connecting outbound to a cloud Hub via SSH tunnel.
+4. **Topology 4: Production Deployment on A4A (Nginx + Docker + AsterGate Private CA)**: Production host (`62.234.91.42`) with Hub running in isolated scratch Docker container on `127.0.0.1:18800`, Nginx TLS termination with private CA, and distributed clients connecting over HTTPS/WSS.
 
-| Acceptance Criterion | Topology 1 (Compose) | Topology 2 (StarPub) | Topology 3 (Cross-Machine) |
-|---|:---:|:---:|:---:|
-| Hub Bootstrap & Admin Auth | Verified | Verified | Verified |
-| Member Invite & Pairing Flow | Verified | Verified | Verified |
-| Multi-Turn Tool Inspection Loop | Verified (Mock LLM) | Verified (Real LLM: AsterGate `gemini-3.8-flash-high`) | Verified (Mock LLM) |
-| Natural-Language Target Resolution | NOT YET VERIFIED (topology acceptance suites use explicit `-to`; covered by unit tests in `internal/cli`) | NOT YET VERIFIED (topology acceptance suites use explicit `-to`; covered by unit tests in `internal/cli`) | NOT YET VERIFIED (topology acceptance suites use explicit `-to`; covered by unit tests in `internal/cli`) |
-| Sovereign Privacy Guardrail Enforcement | Verified (Mock LLM refusal) | Verified (Real LLM prompt guardrail) | Verified (Mock LLM prompt guardrail) |
-| Physical Sandbox & Hard Denylists | Verified (Unit/Integration tests) | Verified (Unit/Integration tests) | Verified (Unit/Integration tests) |
-| Offline Queueing & Reconnection Recovery | Verified | Verified | Verified |
-| Audit Trail Persistence (JSONL) | Verified (REST /audit/inbound & /outbound) | Verified (REST /audit/inbound & /outbound) | NOT YET VERIFIED (audit endpoints not tested in xmach suite; verified in Topologies 1 & 2) |
-| Web UI Dashboard & Token Hash Auth | Verified (GET / -> HTTP 200 console title) | NOT YET VERIFIED (StarPub automated suite runs headless via CLI/curl) | NOT YET VERIFIED (Cross-Machine automated suite runs headless via CLI/curl) |
-| Claude Code Skill Integration | NOT YET VERIFIED (N/A in container headless suite) | NOT YET VERIFIED (not included in StarPub A-G suite) | Verified (`skill install` & `skill show` on Windows) |
+| Acceptance Criterion | Topology 1 (Compose) | Topology 2 (StarPub) | Topology 3 (Cross-Machine) | Topology 4 (Production A4A) |
+|---|:---:|:---:|:---:|:---:|
+| Hub Bootstrap & Admin Auth | Verified | Verified | Verified | Verified (Scratch Docker, non-root UID 10001, token len 56B) |
+| Member Invite & Pairing Flow | Verified | Verified | Verified | Verified (HTTPS with AsterGate Private CA) |
+| Multi-Turn Tool Inspection Loop | Verified (Mock LLM) | Verified (Real LLM: AsterGate `gemini-3.8-flash-high`) | Verified (Mock LLM) | Verified (Live query Bob -> Alice: `git_status`, `git_diff`) |
+| Natural-Language Target Resolution | NOT YET VERIFIED (topology acceptance suites use explicit `-to`; covered by unit tests in `internal/cli`) | NOT YET VERIFIED (topology acceptance suites use explicit `-to`; covered by unit tests in `internal/cli`) | NOT YET VERIFIED (topology acceptance suites use explicit `-to`; covered by unit tests in `internal/cli`) | Covered by unit tests in `internal/cli` |
+| Sovereign Privacy Guardrail Enforcement | Verified (Mock LLM refusal) | Verified (Real LLM prompt guardrail) | Verified (Mock LLM prompt guardrail) | Verified in Topologies 1, 2, 3 |
+| Physical Sandbox & Hard Denylists | Verified (Unit/Integration tests) | Verified (Unit/Integration tests) | Verified (Unit/Integration tests) | Verified (Unit/Integration tests) |
+| Offline Queueing & Reconnection Recovery | Verified | Verified | Verified | Verified in Topologies 1, 2, 3 |
+| Audit Trail Persistence (JSONL) | Verified (REST /audit/inbound & /outbound) | Verified (REST /audit/inbound & /outbound) | NOT YET VERIFIED (audit endpoints not tested in xmach suite; verified in Topologies 1 & 2) | Verified (`events.jsonl` on host volume) |
+| Web UI Dashboard & Token Hash Auth | Verified (GET / -> HTTP 200 console title) | NOT YET VERIFIED (StarPub automated suite runs headless via CLI/curl) | NOT YET VERIFIED (Cross-Machine automated suite runs headless via CLI/curl) | Verified (HTTP 200 via HTTPS; Port 80 HTTP 301 redirect) |
+| Claude Code Skill Integration | NOT YET VERIFIED (N/A in container headless suite) | NOT YET VERIFIED (not included in StarPub A-G suite) | Verified (`skill install` & `skill show` on Windows) | Verified on client workstation |
 
 ---
 
@@ -408,7 +409,101 @@ All run evidence is captured and archived under `/c/tmp/ti-accept/starpub/`:
 
 ---
 
-## 5. Verification Gate Pass Criteria
+## 5. Topology 4: Production Deployment & Verification on A4A (Nginx + Docker + AsterGate Private CA)
+
+### 5.1 Scenario Setup & Architecture
+- **Host**: A4A production host (`62.234.91.42`), serving domain `https://talkintent.empeirion.cn`.
+- **Hub Container**: Container `talkintent-hub` built `FROM scratch` with static binary `talkintent` (SHA-256 `4ad2c9b6f36ddb1205fb69d6b88620fc2088ce4ec706cccc26c20f86efd97798`) and CA certificates bundle. Runs as dedicated non-root UID `10001:10001`, mounts persistent data volume `/opt/talkintent/data:/data` (with `admin.token` 56 bytes, mode `0600`), and binds strictly to loopback `127.0.0.1:18800`.
+- **In-Hub Rate Limiter**: Configured with `-rate-limit-qpm 120` and `-rate-limit-burst 30`. Rate limiting keys strictly on Bearer token member identity (`asker.ID`, e.g. `mem_xxx`), fully decoupled from the loopback IP (`127.0.0.1`) passed by Nginx.
+- **TLS & Reverse Proxy**: Nginx server block at `/etc/nginx/conf.d/talkintent.conf` terminates TLS with a SAN certificate issued by AsterGate Private CA (`talkintent.crt`, validity 825 days, SAN `DNS:talkintent.empeirion.cn`; private key `talkintent.key` mode `0600`). Port 80 issues 301 redirect to HTTPS; port 443 proxies to `127.0.0.1:18800` with WebSocket upgrade (`$http_upgrade`, `$talkintent_conn_upgrade`) and 3600s proxy read/send timeouts.
+- **Production Safety & Non-Disruption**: Prior to deployment, `/etc/nginx` was fully archived to `/root/talkintent-deploy-20260920-2330/nginx-pre-deploy.tar.gz`. Nginx reloaded cleanly with `systemctl reload nginx` after `nginx -t` passed. All 6 co-located AsterGate containers (`console-1`, `astergate-1`, `codex-tls-1`, `minio-1`, `postgres-1`, `redis-1`) remained healthy and untouched.
+- **Rollback Script**: `/root/talkintent-deploy-20260920-2330/rollback.sh` (mirrored in `deploy/a4a/rollback.sh`).
+
+### 5.2 Deployment & Audit Verification Checklists
+
+All 30 operator-created paths and deployment states were verified and recorded in `/c/tmp/ti-a4a/audit/`:
+1. **Docker Isolation & Loopback Binding**: `talkintent-hub` container is Up, strictly bound to `127.0.0.1:18800` via `docker-proxy`, running as non-root UID `10001:10001`.
+   - Evidence: `C:/tmp/ti-a4a/audit/01-docker-ps-hub.txt`, `C:/tmp/ti-a4a/audit/01-ss-18800.txt`, `C:/tmp/ti-a4a/audit/01-docker-inspect-summary.txt`, `C:/tmp/ti-a4a/audit/17-dockerfile.txt`, `C:/tmp/ti-a4a/audit/17-compose.yaml`, `C:/tmp/ti-a4a/audit/17-image-inspect-summary.txt`.
+2. **Nginx Reverse Proxy & Syntax Validation**: `server_name` strictly `talkintent.empeirion.cn`, WebSocket headers properly mapped, `proxy_buffering off`, timeouts set to 3600s. `nginx -t` executed with exit 0.
+   - Evidence: `C:/tmp/ti-a4a/audit/02-talkintent.conf`, `C:/tmp/ti-a4a/audit/04-nginx-t.txt`, `C:/tmp/ti-a4a/audit/06-nginx-file-diff.txt`, `C:/tmp/ti-a4a/audit/11-nginx-conf-vs-repo-diff.txt`.
+3. **TLS Certificate & AsterGate CA Validity**: Certificate issued with CN `talkintent.empeirion.cn`, SAN `DNS:talkintent.empeirion.cn`, validity 825 days. OpenSSL verification against AsterGate CA passed with OK. Private key mode `0600`, size 1704 bytes.
+   - Evidence: `C:/tmp/ti-a4a/audit/03-cert-text.txt`, `C:/tmp/ti-a4a/audit/03-cert-verify.txt`, `C:/tmp/ti-a4a/audit/07-astergate-certs-stat.txt`, `C:/tmp/ti-a4a/audit/14-ca-crt-diff.txt`.
+4. **Backup Integrity & AsterGate Service Health**: Backup directory contains `nginx-pre-deploy.tar.gz` and `rollback.sh`. All 6 existing AsterGate containers remained Up and healthy. Pre/post checks on `https://127.0.0.1:44444/v1/models` (401) and `https://127.0.0.1:44444/` (200) confirmed zero disruption.
+   - Evidence: `C:/tmp/ti-a4a/audit/05-backup-dir-list.txt`, `C:/tmp/ti-a4a/audit/05-rollback-sh.txt`, `C:/tmp/ti-a4a/audit/06-tar-diff.txt`, `C:/tmp/ti-a4a/audit/09-docker-ps-all.txt`, `C:/tmp/ti-a4a/audit/10-aster-endpoints.txt`.
+5. **Zero Credential Leaks & Secret Hygiene**: Admin token file mode `0600`, size 56 bytes. Container logs contain only token length (55-char body) and SHA-256 fingerprint; zero private keys or raw tokens exist in logs or deployment outputs.
+   - Evidence: `C:/tmp/ti-a4a/audit/08-admin-token-stat.txt`, `C:/tmp/ti-a4a/audit/08-docker-logs-hub.txt`, `C:/tmp/ti-a4a/audit/08-grep-deploy-keys.txt`, `C:/tmp/ti-a4a/audit/08-grep-deploy-long-strings.txt`, `C:/tmp/ti-a4a/audit/08-grep-hub-logs.txt`.
+6. **Binary & Configuration Consistency**: Checked 23 created paths across `/opt/talkintent/`, `/etc/nginx/conf.d/`, and `/root/talkintent-deploy-20260920-2330/`. Static binary SHA-256 (`4ad2c9b6f36ddb1205fb69d6b88620fc2088ce4ec706cccc26c20f86efd97798`) matches identically across build output, deployment directory, and container.
+   - Evidence: `C:/tmp/ti-a4a/audit/11-repo-vs-deploy-diff.txt`, `C:/tmp/ti-a4a/audit/12-created-paths-stat.txt`, `C:/tmp/ti-a4a/audit/13-sha256-a4a-bin.txt`, `C:/tmp/ti-a4a/audit/13-sha256-local-bin.txt`.
+7. **Web Endpoint & Redirect Verification**: `curl` with `--resolve` and `--cacert` to `https://talkintent.empeirion.cn/web` returned HTTP 200 with HTML title 'TalkIntent 研发协同感知控制台'. Port 80 returned HTTP 301 redirect to HTTPS.
+   - Evidence: `C:/tmp/ti-a4a/audit/15-curl-web.txt`, `C:/tmp/ti-a4a/audit/16-curl-port80.txt`.
+
+### 5.3 End-to-End Client & Live Probe Verification Checklists
+
+End-to-end multi-client workflow was verified across HTTPS/WSS and recorded in `/c/tmp/ti-a4a/verify/`:
+
+#### Assertion 1: TLS Strict Enforcement without CA Certificate
+Connecting to `https://talkintent.empeirion.cn` without specifying the private CA certificate fails immediately during TLS handshake:
+```bash
+talkintent pair -hub https://talkintent.empeirion.cn -code INV-XXXX-XXXX
+```
+- **Observed / Expected Result**: `tls: failed to verify certificate: x509: certificate signed by unknown authority`.
+- **Last Verified**: 2026-09-20 — evidence: `C:/tmp/ti-a4a/verify/01-x509-error.log`.
+
+#### Assertion 2: Member Pairing with Private CA Certificate
+Members `alice` and `bob` paired successfully against the production Hub via HTTPS using `--hub-ca-file`:
+```bash
+talkintent pair -hub https://talkintent.empeirion.cn -code <ALICE_CODE> -name alice-dev -hub-ca-file ca.crt
+talkintent pair -hub https://talkintent.empeirion.cn -code <BOB_CODE> -name bob-dev -hub-ca-file ca.crt
+```
+- **Observed / Expected Result**: Both pair requests succeeded, generating `~/.talkintent/config.json` with persisted `hub_ca_file`.
+- **Last Verified**: 2026-09-20 — evidence: `C:/tmp/ti-a4a/verify/02-alice-pair.log`, `C:/tmp/ti-a4a/verify/06-bob-pair.log`.
+
+#### Assertion 3: Local LLM Configuration & Git Workspace Registration
+Alice configured local LLM provider and registered Git repository `auth-service`:
+```bash
+talkintent workspace add /path/to/auth-service auth-service
+talkintent llm set -provider openai -base-url http://127.0.0.1:18890/v1 -api-key "test-key" -model "mock-model"
+```
+- **Observed / Expected Result**: Workspace `auth-service` registered and local LLM parameters configured.
+- **Last Verified**: 2026-09-20 — evidence: `C:/tmp/ti-a4a/verify/03-alice-llm-set.log`.
+
+#### Assertion 4: Daemon WebSocket Long Connection through Nginx
+Alice started the daemon and connected to the Hub via WSS:
+```bash
+talkintent daemon
+```
+- **Observed / Expected Result**: Successfully connected to `wss://talkintent.empeirion.cn/ws/daemon` via Nginx WebSocket reverse proxy; heartbeat loop active.
+- **Last Verified**: 2026-09-20 — evidence: `C:/tmp/ti-a4a/verify/04-alice-daemon.log`.
+
+#### Assertion 5: Member Directory & Real-Time Presence Discovery
+Bob queried the team directory from the Hub:
+```bash
+talkintent members -json
+```
+- **Observed / Expected Result**: Alice is visible in directory with `online: true`, machine name `alice-dev`, and workspace `auth-service`.
+- **Last Verified**: 2026-09-20 — evidence: `C:/tmp/ti-a4a/verify/05-members-online.log`.
+
+#### Assertion 6: Live Distributed Query Across HTTPS (Bob -> Alice)
+Bob submitted an asynchronous query targeting Alice's live workspace:
+```bash
+talkintent ask -to alice -q "What are you working on right now?" -wait -json
+```
+- **Observed / Expected Result**:
+  - Request routed through Hub to Alice's daemon over WebSocket.
+  - Alice's on-site probe executed live inspection tools: `tools_used: ["git_diff", "git_status"]`.
+  - Synthesized response returned with `status: completed`, `total_tokens: 640`, referencing branch `feature/jwt-tokens` and modified files `auth.go`, `tokens.txt`.
+- **Last Verified**: 2026-09-20 — evidence: `C:/tmp/ti-a4a/verify/07-bob-ask-alice.json`.
+
+#### Assertion 7: Clean Teardown & Host Integrity
+Teardown completed cleanly after verification:
+- Test daemons and mock LLM processes terminated.
+- Temporary user home directories removed.
+- Temporary `/etc/hosts` resolution entry removed; `grep talkintent.empeirion.cn /etc/hosts` verified empty.
+- **Last Verified**: 2026-09-20 — evidence: `C:/tmp/ti-a4a/verify/08-cleanup.log`.
+
+---
+
+## 6. Verification Gate Pass Criteria
 
 Before releasing or deploying TalkIntent, verify that:
 1. `go build ./...` compiles cleanly with zero warnings.

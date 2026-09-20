@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ type PairOptions struct {
 	InviteCode  string
 	MachineName string
 	ConfigPath  string
+	HubCAFile   string
 	JSONOutput  bool
 }
 
@@ -35,6 +37,24 @@ func ExecutePair(ctx context.Context, opts PairOptions, stdout, stderr io.Writer
 	if hubURL == "" || inviteCode == "" {
 		fmt.Fprintf(stderr, "Error: both --hub and --code are required (e.g. talkintent pair --hub http://hub:8080 --code INV-XXXX)\n")
 		return 1
+	}
+
+	// Resolve CA file if provided via flag, env, or existing config
+	caFile := strings.TrimSpace(opts.HubCAFile)
+	if caFile == "" {
+		caFile = strings.TrimSpace(os.Getenv(config.EnvTalkIntentHubCAFile))
+	}
+	if caFile == "" {
+		if existingCfg, err := config.LoadClientConfig(opts.ConfigPath); err == nil && existingCfg != nil {
+			caFile = strings.TrimSpace(existingCfg.HubCAFile)
+		}
+	}
+
+	if caFile != "" {
+		absPath, err := filepath.Abs(caFile)
+		if err == nil {
+			caFile = absPath
+		}
 	}
 
 	machineName := opts.MachineName
@@ -62,7 +82,11 @@ func ExecutePair(ctx context.Context, opts PairOptions, stdout, stderr io.Writer
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client, err := config.NewHubHTTPClient(caFile, 15*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "Error initializing TLS configuration for Hub CA %q: %v\n", caFile, err)
+		return 1
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(stderr, "Pairing request failed: %v\n", err)
@@ -99,6 +123,9 @@ func ExecutePair(ctx context.Context, opts PairOptions, stdout, stderr io.Writer
 	}
 
 	cfg.HubURL = hubURL
+	if caFile != "" {
+		cfg.HubCAFile = caFile
+	}
 	cfg.MemberID = pairResp.MemberID
 	cfg.MemberName = pairResp.MemberName
 	cfg.Token = pairResp.Token
@@ -120,6 +147,7 @@ func ExecutePair(ctx context.Context, opts PairOptions, stdout, stderr io.Writer
 			"member_id":   pairResp.MemberID,
 			"member_name": pairResp.MemberName,
 			"hub_url":     hubURL,
+			"hub_ca_file": cfg.HubCAFile,
 			"machine":     machineName,
 			"config_path": savedPath,
 		})
@@ -130,6 +158,9 @@ func ExecutePair(ctx context.Context, opts PairOptions, stdout, stderr io.Writer
 	fmt.Fprintf(stdout, "  Member ID:   %s\n", pairResp.MemberID)
 	fmt.Fprintf(stdout, "  Member Name: %s\n", pairResp.MemberName)
 	fmt.Fprintf(stdout, "  Hub URL:     %s\n", hubURL)
+	if cfg.HubCAFile != "" {
+		fmt.Fprintf(stdout, "  Hub CA File: %s\n", cfg.HubCAFile)
+	}
 	fmt.Fprintf(stdout, "  Machine:     %s\n", machineName)
 	fmt.Fprintf(stdout, "  Config saved: %s (0600)\n", savedPath)
 	return 0

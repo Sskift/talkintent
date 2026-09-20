@@ -28,7 +28,7 @@ func ExecuteMembers(ctx context.Context, opts MembersOptions, stdout, stderr io.
 		return 1
 	}
 
-	members, err := FetchMembers(ctx, cfg.HubURL, cfg.Token)
+	members, err := FetchMembers(ctx, cfg.HubURL, cfg.Token, cfg.HubCAFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error fetching member directory: %v\n", err)
 		return 1

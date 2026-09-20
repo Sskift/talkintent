@@ -349,8 +349,14 @@ func (d *ClientDaemon) connectAndServe(ctx context.Context) error {
 	headers.Set("X-Client-Version", ClientVersion)
 	headers.Set("X-Machine-Name", d.cfg.MachineName)
 
+	httpClient, err := config.NewHubHTTPClient(d.cfg.HubCAFile, 0)
+	if err != nil {
+		return fmt.Errorf("failed to build hub tls config: %w", err)
+	}
+
 	opts := &websocket.DialOptions{
 		HTTPHeader: headers,
+		HTTPClient: httpClient,
 	}
 
 	dialCtx, cancelDial := context.WithCancel(ctx)

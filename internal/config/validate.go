@@ -69,6 +69,17 @@ func (c *ClientConfig) Validate() error {
 		}
 	}
 
+	// HubCAFile
+	if c.HubCAFile != "" {
+		if _, err := os.Stat(c.HubCAFile); err != nil {
+			errs = append(errs, ValidationError{
+				Field:       "hub_ca_file",
+				Message:     fmt.Sprintf("Hub CA certificate file %q not found", c.HubCAFile),
+				Remediation: "provide an existing PEM certificate file path or unset",
+			})
+		}
+	}
+
 	// Member ID & Token
 	if c.MemberID == "" {
 		errs = append(errs, ValidationError{

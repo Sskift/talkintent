@@ -24,15 +24,21 @@ type InviteOptions struct {
 	TargetName     string
 	Aliases        []string
 	ExpiresInHours int
+	HubCAFile      string
 	JSONOutput     bool
 }
 
 // ExecuteInvite calls the Hub REST endpoint to generate a new onboarding invite code.
 func ExecuteInvite(ctx context.Context, opts InviteOptions, stdout, stderr io.Writer) int {
+	var loadedCfg *config.ClientConfig
+	if cfg, err := config.LoadClientConfig(opts.ConfigPath); err == nil && cfg != nil {
+		loadedCfg = cfg
+	}
+
 	hubURL := strings.TrimRight(opts.HubURL, "/")
 	if hubURL == "" {
-		if cfg, err := config.LoadClientConfig(opts.ConfigPath); err == nil && cfg != nil && cfg.HubURL != "" {
-			hubURL = strings.TrimRight(cfg.HubURL, "/")
+		if loadedCfg != nil && loadedCfg.HubURL != "" {
+			hubURL = strings.TrimRight(loadedCfg.HubURL, "/")
 		} else if env := os.Getenv("TALKINTENT_HUB_URL"); env != "" {
 			hubURL = strings.TrimRight(env, "/")
 		} else {
@@ -93,7 +99,19 @@ func ExecuteInvite(ctx context.Context, opts InviteOptions, stdout, stderr io.Wr
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	caFile := strings.TrimSpace(opts.HubCAFile)
+	if caFile == "" {
+		caFile = strings.TrimSpace(os.Getenv(config.EnvTalkIntentHubCAFile))
+	}
+	if caFile == "" && loadedCfg != nil {
+		caFile = strings.TrimSpace(loadedCfg.HubCAFile)
+	}
+
+	client, err := config.NewHubHTTPClient(caFile, 15*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "Failed to create http client: %v\n", err)
+		return 1
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(stderr, "Failed to connect to Hub at %s: %v\n", hubURL, err)

@@ -118,15 +118,20 @@ func ExecuteStatus(ctx context.Context, opts StatusOptions, stdout, stderr io.Wr
 				req.Header.Set("Authorization", "Bearer "+cfg.Token)
 			}
 			start := time.Now()
-			client := &http.Client{Timeout: 3 * time.Second}
-			resp, err := client.Do(req)
-			if err == nil {
-				report.Hub.Reachable = true
-				report.Hub.LatencyMS = time.Since(start).Milliseconds()
-				resp.Body.Close()
-			} else {
+			client, err := config.NewHubHTTPClient(cfg.HubCAFile, 3*time.Second)
+			if err != nil {
 				report.Hub.Reachable = false
 				report.Hub.Error = err.Error()
+			} else {
+				resp, err := client.Do(req)
+				if err == nil {
+					report.Hub.Reachable = true
+					report.Hub.LatencyMS = time.Since(start).Milliseconds()
+					resp.Body.Close()
+				} else {
+					report.Hub.Reachable = false
+					report.Hub.Error = err.Error()
+				}
 			}
 		}
 	}

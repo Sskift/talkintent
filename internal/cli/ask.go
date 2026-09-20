@@ -120,7 +120,7 @@ func ExtractTarget(queryText string, members []protocol.MemberInfo) (target stri
 }
 
 // FetchMembers retrieves the member directory from the Hub.
-func FetchMembers(ctx context.Context, hubURL, token string) ([]protocol.MemberInfo, error) {
+func FetchMembers(ctx context.Context, hubURL, token string, caFile ...string) ([]protocol.MemberInfo, error) {
 	url := strings.TrimRight(hubURL, "/") + "/api/v1/members"
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -130,7 +130,15 @@ func FetchMembers(ctx context.Context, hubURL, token string) ([]protocol.MemberI
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	var ca string
+	if len(caFile) > 0 {
+		ca = caFile[0]
+	}
+
+	client, err := config.NewHubHTTPClient(ca, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create http client: %w", err)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch members: %w", err)
@@ -184,7 +192,7 @@ func ExecuteAsk(ctx context.Context, cfg *config.ClientConfig, opts RunAskOption
 
 	// 1. Natural Language Target Extraction if target not specified explicitly
 	if target == "" {
-		members, err := FetchMembers(ctx, cfg.HubURL, cfg.Token)
+		members, err := FetchMembers(ctx, cfg.HubURL, cfg.Token, cfg.HubCAFile)
 		if err != nil {
 			fmt.Fprintf(stderr, "Warning: failed to fetch member directory for natural-language target resolution: %v\n", err)
 		} else if len(members) > 0 {
@@ -210,7 +218,7 @@ func ExecuteAsk(ctx context.Context, cfg *config.ClientConfig, opts RunAskOption
 	// 2. If target is still unresolvable, display member list (F37)
 	if target == "" {
 		fmt.Fprintf(stderr, "Error: unable to determine target teammate from query.\n")
-		members, err := FetchMembers(ctx, cfg.HubURL, cfg.Token)
+		members, err := FetchMembers(ctx, cfg.HubURL, cfg.Token, cfg.HubCAFile)
 		if err == nil && len(members) > 0 {
 			fmt.Fprintf(stderr, "\nAvailable Team Members:\n")
 			PrintMembersTable(stderr, members)
@@ -256,7 +264,11 @@ func ExecuteAsk(ctx context.Context, cfg *config.ClientConfig, opts RunAskOption
 	if !opts.Wait {
 		httpTimeout = 15 * time.Second
 	}
-	client := &http.Client{Timeout: httpTimeout}
+	client, err := config.NewHubHTTPClient(cfg.HubCAFile, httpTimeout)
+	if err != nil {
+		fmt.Fprintf(stderr, "Error creating http client: %v\n", err)
+		return 1
+	}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -378,7 +390,11 @@ func ExecuteAsk(ctx context.Context, cfg *config.ClientConfig, opts RunAskOption
 		}
 		pollReq.Header.Set("Authorization", "Bearer "+cfg.Token)
 
-		pollClient := &http.Client{Timeout: time.Duration(pollWaitSec+5) * time.Second}
+		pollClient, err := config.NewHubHTTPClient(cfg.HubCAFile, time.Duration(pollWaitSec+5)*time.Second)
+		if err != nil {
+			fmt.Fprintf(stderr, "Failed to build poll http client: %v\n", err)
+			return 1
+		}
 		pollResp, err := pollClient.Do(pollReq)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {

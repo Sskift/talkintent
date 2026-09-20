@@ -11,6 +11,7 @@ import (
 // Environment variable constants for TalkIntent client and hub overrides.
 const (
 	EnvTalkIntentHubURL         = "TALKINTENT_HUB_URL"
+	EnvTalkIntentHubCAFile      = "TALKINTENT_HUB_CA_FILE"
 	EnvTalkIntentToken          = "TALKINTENT_TOKEN"
 	EnvTalkIntentMemberToken    = "TALKINTENT_MEMBER_TOKEN" // Alias for TALKINTENT_TOKEN
 	EnvTalkIntentMemberID       = "TALKINTENT_MEMBER_ID"
@@ -53,6 +54,9 @@ func (c *ClientConfig) ApplyEnvOverrides() {
 
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentHubURL)); v != "" {
 		c.HubURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentHubCAFile)); v != "" {
+		c.HubCAFile = v
 	}
 	if v := strings.TrimSpace(os.Getenv(EnvTalkIntentToken)); v != "" {
 		c.Token = v

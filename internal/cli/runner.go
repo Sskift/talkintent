@@ -141,7 +141,8 @@ func runPairCmd(ctx context.Context, args []string, stdout, stderr io.Writer) in
 			if !strings.Contains(arg, "=") && (arg == "-hub" || arg == "--hub" ||
 				arg == "-code" || arg == "--code" ||
 				arg == "-name" || arg == "--name" ||
-				arg == "-config" || arg == "--config") {
+				arg == "-config" || arg == "--config" ||
+				arg == "-hub-ca-file" || arg == "--hub-ca-file") {
 				if i+1 < len(args) {
 					i++
 					flagArgs = append(flagArgs, args[i])
@@ -158,6 +159,7 @@ func runPairCmd(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	code := fs.String("code", "", "One-time invite code provided by administrator")
 	machine := fs.String("name", "", "Machine label (defaults to hostname)")
 	cfgPath := fs.String("config", "", "Path to client config.json")
+	hubCAFile := fs.String("hub-ca-file", "", "Path to custom CA certificate PEM bundle for Hub verification")
 	jsonOut := fs.Bool("json", false, "Output in JSON format")
 
 	if err := fs.Parse(flagArgs); err != nil {
@@ -195,6 +197,7 @@ func runPairCmd(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		InviteCode:  codeVal,
 		MachineName: *machine,
 		ConfigPath:  *cfgPath,
+		HubCAFile:   *hubCAFile,
 		JSONOutput:  *jsonOut,
 	}
 	return ExecutePair(ctx, opts, stdout, stderr)
@@ -576,6 +579,7 @@ func runInviteCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	alias := fs.String("alias", "", "Comma-separated member aliases")
 	expires := fs.Int("expires-hours", 72, "Invite expiration duration in hours")
 	cfgPath := fs.String("config", "", "Path to client config.json")
+	hubCAFile := fs.String("hub-ca-file", "", "Path to custom CA certificate PEM bundle for Hub verification")
 	jsonOut := fs.Bool("json", false, "Output in JSON format")
 
 	if err := fs.Parse(args); err != nil {
@@ -604,6 +608,7 @@ func runInviteCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		TargetName:     nameVal,
 		Aliases:        aliases,
 		ExpiresInHours: *expires,
+		HubCAFile:      *hubCAFile,
 		JSONOutput:     *jsonOut,
 	}
 	return ExecuteInvite(ctx, opts, stdout, stderr)

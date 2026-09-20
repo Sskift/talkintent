@@ -1,0 +1,22 @@
+services:
+  hub:
+    image: talkintent-hub:latest
+    container_name: talkintent-hub
+    restart: unless-stopped
+    user: "10001:10001"
+    command:
+      - "hub"
+      - "-addr"
+      - ":18800"
+      - "-data-dir"
+      - "/data"
+      - "-public-url"
+      - "https://talkintent.empeirion.cn"
+      - "-rate-limit-qpm"
+      - "120"
+      - "-rate-limit-burst"
+      - "30"
+    ports:
+      - "127.0.0.1:18800:18800"
+    volumes:
+      - /opt/talkintent/data:/data

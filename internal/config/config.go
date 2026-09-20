@@ -112,6 +112,7 @@ type DaemonConfig struct {
 // ClientConfig represents the complete configuration stored on a member's machine.
 type ClientConfig struct {
 	HubURL                  string            `json:"hub_url"`
+	HubCAFile               string            `json:"hub_ca_file,omitempty"`
 	MemberID                string            `json:"member_id"`
 	MemberName              string            `json:"member_name"`
 	Token                   string            `json:"token"`

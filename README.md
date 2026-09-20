@@ -59,7 +59,7 @@ Exchange the one-time invite code for a permanent member token:
 ```bash
 talkintent pair --hub http://<hub-ip>:8080 --code INV-9X2M-4K7Q --name "zhangsan-macbook"
 ```
-*Stores credentials in `~/.talkintent/config.json` with strict `0600` permissions.*
+*Stores credentials in `~/.talkintent/config.json` with strict `0600` permissions. If the Hub uses HTTPS with a private CA or self-signed certificate, append `--hub-ca-file /path/to/ca.pem` (or set `TALKINTENT_HUB_CA_FILE`), and the absolute path will be validated and persisted into `config.json`.*
 
 #### B. Register Workspaces to Monitor
 Register the repositories you want the on-site probe to perceive:
@@ -225,6 +225,20 @@ Validates distributed operations across physical/virtual machine boundaries over
   ```bash
   ./deploy/xmachine/stop.sh
   ```
+
+### Topology 4: Production Deployment on A4A (Nginx + Docker + AsterGate Private CA)
+Production deployment assets and automated scripts for the A4A production host (`62.234.91.42`), serving `https://talkintent.empeirion.cn`:
+- **Components**:
+  - Central Hub running inside an isolated Docker container (`talkintent-hub`) built `FROM scratch` with static binary (`talkintent`), running as dedicated non-root UID `10001:10001`, with data volume `/opt/talkintent/data:/data`, and strictly bound to loopback `127.0.0.1:18800`.
+  - In-hub rate limiting keyed on Bearer token member identity (`asker.ID`), fully decoupled from Nginx loopback `RemoteAddr` (`127.0.0.1`).
+  - Nginx reverse proxy on host terminating TLS at `https://talkintent.empeirion.cn` (port 80 redirects 301 to HTTPS; port 443 terminates TLS with SAN certificate issued by AsterGate Private CA and proxies WebSocket `/ws/daemon` with 3600s timeouts).
+  - Production safety: co-located services (AsterGate gateway, console, DBs) remained completely untouched; Nginx reloaded via `systemctl reload nginx` only after `nginx -t` syntax verification and full `/etc/nginx` tarball backup (`/root/talkintent-deploy-20260920-2330/nginx-pre-deploy.tar.gz`).
+  - Automated deployment and rollback scripts: `deploy/a4a/install.sh` and `deploy/a4a/rollback.sh`.
+- **Client Connectivity & Onboarding**:
+  1. Add `62.234.91.42 talkintent.empeirion.cn` to `/etc/hosts` (or Windows `hosts`).
+  2. Obtain `ca.crt` (AsterGate Private CA root certificate).
+  3. Pair using `talkintent pair --hub https://talkintent.empeirion.cn --code <INVITE_CODE> --hub-ca-file ca.crt`.
+  4. Access Web UI at `https://talkintent.empeirion.cn/web` (trust `ca.crt` in system/browser or accept certificate exception).
 
 ---
 

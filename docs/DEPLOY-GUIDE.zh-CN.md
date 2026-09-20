@@ -305,6 +305,84 @@ server {
 }
 ```
 
+### 3.6 生产部署示例：Nginx + 私有 CA + Docker (A4A)
+
+TalkIntent 已在团队 A4A 生产宿主机（`62.234.91.42`）完成标准化生产级落地，对外提供统一安全域名服务 `https://talkintent.empeirion.cn`。完整的生产编排配置与自动化安装脚本位于代码仓库的 `deploy/a4a/` 目录下。
+
+#### 3.6.1 架构拓扑与多租户容器隔离
+
+A4A 生产节点上同时运行着多个关键业务系统（包括 AsterGate 大模型网关及其配套的数据库、控制台和缓存容器）。为确保各组件互不侵扰、满足最小特权原则并杜绝依赖冲突，TalkIntent 采取了严密的生产级隔离策略：
+1. **Docker 静态轻量化隔离**：采用 `deploy/a4a/Dockerfile` 基于 `FROM scratch` 构建纯静态容器镜像 `talkintent-hub:latest`，容器内部仅包含编译好的单二进制 `talkintent`（SHA-256 校验值为 `4ad2c9b6f36ddb1205fb69d6b88620fc2088ce4ec706cccc26c20f86efd97798`）与公共 CA 根证书包，无基础 OS 漏洞面，不依赖外部 Docker Hub 拉取。
+2. **专属非 Root 运行账户**：容器使用内部非特权用户 `10001:10001`（`talkintent:talkintent`）运行，宿主机对应数据目录 `/opt/talkintent/data` 设为 `0700` 权限并归属 `10001:10001`。
+3. **回环端口物理隔离**：Docker 端口映射严格限定为 `127.0.0.1:18800:18800`，外部网络无法直连容器端口，所有流量必须经由宿主机 Nginx 反向代理进行 TLS 终止与校验。
+4. **身份感知限流机制**：Hub 服务内置速率限制器（Rate Limiter），由 `-rate-limit-qpm 120` 与 `-rate-limit-burst 30` 驱动。限流计数桶强绑定发起提问方的 Bearer 令牌成员身份标识（`asker.ID`，如 `mem_xxx`），完全解耦于反向代理层透传的 `127.0.0.1` 远端网络回环地址，彻底避免单成员提问频次挤占其他成员配额。
+
+#### 3.6.2 生产部署资产与文件清单
+
+生产交付资产完整维护于仓库 `deploy/a4a/` 目录（宿主机对应映射目录为 `/opt/talkintent/deploy/`），包含以下关键文件：
+- `Dockerfile`：基于 scratch 的单二进制精简打包配置；
+- `compose.yaml`：`talkintent-hub` 容器的 Docker Compose 服务编排文件；
+- `talkintent.conf`：包含端口 80 重定向、TLS 终止与长超时 WebSocket 反向代理的 Nginx 配置片段；
+- `issue-cert.sh`：调用宿主机现有 AsterGate 私有 CA（`/home/ubuntu/astergate-deploy/certs/ca.crt` 与 `ca.key`）签发 SAN=DNS:talkintent.empeirion.cn 证书（有效期 825 天）的自动化脚本；
+- `install.sh`：端到端自动化安装脚本，执行环境前置检查、备份 nginx 配置、签发证书、构建启动容器、校验配置并平滑重载 Nginx；
+- `rollback.sh`：一键回滚脚本，支持停止容器、还原 Nginx 配置并平滑恢复。
+
+#### 3.6.3 生产运维与一键回滚流程
+
+为保障生产环境的高可用与绝对安全，部署遵循严格的安全红线：
+- **无损平滑重载**：修改 Nginx 配置后必须先执行 `nginx -t` 语法检测，通过后方可使用 `systemctl reload nginx` 平滑加载新规则，绝不执行 `restart` 或 `stop`，确保 AsterGate 等同机生产业务零中断；
+- **部署前基准归档**：在首次部署前，部署脚本已将全量 `/etc/nginx` 备份打包为 `/root/talkintent-deploy-20260920-2330/nginx-pre-deploy.tar.gz`；
+- **一键回滚**：如遇突发异常，运维人员可直接执行回滚脚本：
+  ```bash
+  sudo bash /root/talkintent-deploy-20260920-2330/rollback.sh
+  # 或在仓库目录下执行
+  sudo bash deploy/a4a/rollback.sh
+  ```
+  回滚脚本将安全停止并移除 `talkintent-hub` 容器，删除 `/etc/nginx/conf.d/talkintent.conf`，通过 `nginx -t` 语法自检后平滑重载 Nginx。
+
+#### 3.6.4 团队成员接入 A4A 集群实战步骤
+
+当 Hub 服务在 A4A 宿主机成功启动并通过反向代理对外提供服务后，团队成员即可按照以下 4 个步骤接入集群：
+
+##### 步骤一：配置本地 hosts 域名解析
+在开发机操作系统 hosts 文件中追加 A4A 宿主机 IP 与 TalkIntent 域名的映射记录：
+- **Linux / macOS**（`/etc/hosts`）：
+  ```bash
+  sudo bash -c 'echo "62.234.91.42 talkintent.empeirion.cn" >> /etc/hosts'
+  ```
+- **Windows**（以管理员权限编辑 `C:\Windows\System32\drivers\etc\hosts`），末尾添加：
+  ```text
+  62.234.91.42 talkintent.empeirion.cn
+  ```
+
+##### 步骤二：获取私有 CA 根证书（`ca.crt`）
+由于 `talkintent.empeirion.cn` 的 TLS 证书由团队自建的 AsterGate 私有 CA 签发，系统未将该私有根证书内置在公共受信任库中。
+- 团队成员向管理员索取 `ca.crt` 根证书文件（该文件为公共证书，非私钥，不包含保密凭据）；
+- 将其保存至开发机本地安全目录（例如 Linux/macOS 保存在 `~/.talkintent/ca.crt`，Windows 保存在 `C:\Users\<username>\.talkintent\ca.crt`）。
+
+##### 步骤三：执行 CLI 入网配对（`pair`）
+获取管理员生成的单次有效邀请码（例如 `INV-CE1C1E9C-C60A8A8D`）后，在终端执行配对命令，务必通过 `-hub-ca-file` 参数显式指定私有 CA 证书路径：
+```bash
+talkintent pair -hub https://talkintent.empeirion.cn -code INV-CE1C1E9C-C60A8A8D -name dev-laptop -hub-ca-file ~/.talkintent/ca.crt
+```
+- **机制说明**：若未携带 `-hub-ca-file` 参数，TLS 握手将因未识别签名机构而直接中断，抛出 `tls: failed to verify certificate: x509: certificate signed by unknown authority` 错误；
+- 携带 `-hub-ca-file` 参数后，CLI 将使用该 CA 校验服务端证书的合法性，并在配对成功后将证书的绝对路径持久化记录到 `~/.talkintent/config.json` 的 `hub_ca_file` 字段中。后续日常执行的所有子命令（如 `daemon`、`ask`、`members`、`history` 等）均会自动沿用该根证书，无需重复指定。
+
+##### 步骤四：浏览器访问 Web 仪表盘与私有 CA 信任处理
+团队成员在浏览器中直接打开 Web 控制台地址：
+```text
+https://talkintent.empeirion.cn/web
+```
+首次访问时，由于浏览器尚未信任自建 AsterGate 私有 CA，会弹出“您的连接不是私密连接”或“潜在的安全风险”告警。团队成员可按如下两种方式处理：
+1. **方案 A（推荐，长期使用）——导入系统受信任根证书颁发机构库**：
+   - **Windows**：双击 `ca.crt` 文件 -> 点击“安装证书” -> 选择“当前用户”或“本地计算机” -> 选择“将所有的证书都放入下列存储” -> 点击“浏览”并选中“受信任的根证书颁发机构” -> 完成导入并刷新浏览器页面即可正常通过 HTTPS 绿标访问；
+   - **macOS**：双击 `ca.crt` 打开“钥匙串访问（Keychain Access）” -> 导入至“系统（System）”钥匙串 -> 双击该证书展开“信任（Trust）”折叠项 -> 将“使用此证书时（When using this certificate）”修改为“始终信任（Always Trust）”；
+   - **Linux**：将 `ca.crt` 拷贝至 `/usr/local/share/ca-certificates/` 并执行 `sudo update-ca-certificates`（Debian/Ubuntu），或拷贝至 `/etc/pki/ca-trust/source/anchors/` 并执行 `sudo update-ca-trust`（RHEL/CentOS）。
+2. **方案 B（临时快捷访问）——手动确认安全例外**：
+   - 在 Chrome / Edge 浏览器告警页点击“高级（Advanced）” -> 点击“继续前往 talkintent.empeirion.cn（不安全）”；
+   - 在 Firefox 浏览器告警页点击“高级（Advanced）” -> 点击“接受风险并继续”；
+   - 确认例外后即可直接进入 TalkIntent 研发协同感知 Web 控制台。
+
 ## 4. 成员邀请与配对管理（管理员）
 
 命令调用说明：本节及后续操作示例均假设已将 `talkintent` 可执行文件放置于系统 `PATH` 路径中，故直接使用 `talkintent <subcommand>` 形式调用。若未配置 PATH，请在当前二进制所在目录下使用 `./talkintent`（Linux/macOS）或 `.\talkintent.exe`（Windows）替代执行。
@@ -359,7 +437,7 @@ talkintent pair -hub https://hub.example.com -code INV-CE1C1E9C-C60A8A8D -name d
 ```
 - **参数 `-name` 的核心作用**：在 `pair` 命令中，参数 `-name dev-laptop` 用于指定**当前设备的机器标识（Machine Label）**，例如 `dev-laptop` 或 `office-desktop`。该名称用于多设备协作时的会话标识与路由定位。**若省略该参数，CLI 默认自动获取当前主机的 Hostname**。特别注意：切勿将此处的设备名与管理员发放邀请码时的成员用户名（如 `zhangsan`）混淆。
 
-配对成功后，本地会生成配置文件 `~/.talkintent/config.json`，在 POSIX 系统上权限严格限制为 `0600`。该文件保存专属成员长期令牌 `ti_mem_...`，Hub 服务端仅留存该令牌的哈希散列。
+配对成功后，本地会生成配置文件 `~/.talkintent/config.json`，在 POSIX 系统上权限严格限制为 `0600`。该文件保存专属成员长期令牌 `ti_mem_...`，Hub 服务端仅留存该令牌的哈希散列。若 Hub 处于自签证书或私有 CA 保护下，可追加 `-hub-ca-file /path/to/ca.pem`（或设置 `TALKINTENT_HUB_CA_FILE` 环境变量），配对时将以此校验并自动持久化证书绝对路径（例如针对团队 A4A 生产集群 `https://talkintent.empeirion.cn`，详见第 3.6.4 节四步接入实战）。
 
 ### 5.2 步骤二：注册本地监控工作区（`workspace`）
 配对完成后方可添加工作区。工作区必须为本地已存在的有效 Git 仓库目录。

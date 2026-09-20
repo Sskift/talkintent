@@ -62,7 +62,11 @@ func ExecuteHistory(ctx context.Context, opts HistoryOptions, stdout, stderr io.
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client, err := config.NewHubHTTPClient(cfg.HubCAFile, 15*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "Failed to create http client: %v\n", err)
+		return 1
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(stderr, "Failed to retrieve audit history: %v\n", err)

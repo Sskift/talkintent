@@ -144,3 +144,13 @@ func TestHubConfig_ApplyEnvOverrides_InvalidValues(t *testing.T) {
 		})
 	}
 }
+
+func TestClientConfig_ApplyEnvOverrides_HubCAFile(t *testing.T) {
+	t.Setenv(EnvTalkIntentHubCAFile, "/custom/certs/hub-ca.pem")
+	cfg := NewDefaultClientConfig()
+	cfg.ApplyEnvOverrides()
+
+	if cfg.HubCAFile != "/custom/certs/hub-ca.pem" {
+		t.Errorf("expected HubCAFile '/custom/certs/hub-ca.pem', got %q", cfg.HubCAFile)
+	}
+}
